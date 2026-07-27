@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="bn">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AROWA Support Template Manager</title>
+<style>
+:root{--bg:#f5f7fb;--card:#fff;--text:#172033;--muted:#667085;--line:#dde3ea;--brand:#111827;--soft:#f8fafc;--green:#15803d;--danger:#b42318}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,"Segoe UI","Noto Sans Bengali",sans-serif;background:var(--bg);color:var(--text)}
+header{position:sticky;top:0;z-index:20;background:#fff;border-bottom:1px solid var(--line)}.wrap{max-width:1240px;margin:auto;padding:18px}.top{display:flex;gap:14px;align-items:center;justify-content:space-between;flex-wrap:wrap}h1{margin:0;font-size:25px}.sub{margin:4px 0 0;color:var(--muted)}
+.actions{display:flex;gap:8px;flex-wrap:wrap}button{border:0;border-radius:9px;padding:10px 14px;background:var(--brand);color:#fff;font-weight:700;cursor:pointer}button.secondary{background:#fff;color:#344054;border:1px solid var(--line)}button.danger{background:var(--danger)}button.copied{background:var(--green)}
+.search{width:min(430px,100%);padding:12px 14px;border:1px solid #cfd6df;border-radius:10px;font-size:16px}.nav{display:flex;gap:8px;overflow:auto;padding:0 18px 14px;max-width:1240px;margin:auto}.nav button{white-space:nowrap;background:#fff;color:#344054;border:1px solid var(--line)}.nav button.active{background:var(--brand);color:#fff}.nav .add-category{min-width:44px;font-size:20px;padding:8px 13px;border-style:dashed}.cat-icon{margin-left:6px}.add-card{min-height:170px;border:2px dashed #cbd5e1;background:transparent;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:none}.add-card:hover{border-color:#64748b;background:#fff}.add-card-inner{text-align:center;color:#475467}.add-card-plus{width:44px;height:44px;border-radius:50%;display:grid;place-items:center;margin:0 auto 10px;background:#e2e8f0;color:#111827;font-size:28px;font-weight:500}.add-card strong{font-size:16px}
+.notice{background:#fffbeb;border:1px solid #fde68a;color:#7c5c09;padding:12px 14px;border-radius:12px;margin-bottom:15px}.toolbar{display:flex;justify-content:space-between;gap:10px;align-items:center;margin:10px 0 16px;flex-wrap:wrap}.count{color:var(--muted);font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:16px}.card{background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px;box-shadow:0 4px 18px rgba(15,23,42,.045);cursor:pointer;transition:transform .15s ease,border-color .15s ease,box-shadow .15s ease,background .15s ease}.card:not(.add-card):hover{transform:translateY(-2px);border-color:#aab4c3;box-shadow:0 8px 24px rgba(15,23,42,.09);background:#fcfdff}.card.copy-flash{transform:scale(.992);border-color:var(--green);box-shadow:0 0 0 3px rgba(21,128,61,.12)}.card-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.card h3{margin:0;font-size:17px}.mini-actions{display:flex;gap:6px}.mini-actions button{padding:7px 10px;font-size:12px}.tag{display:inline-block;margin:8px 0;font-size:12px;padding:4px 8px;border-radius:999px;background:#eef2ff;color:#3730a3}select,input,textarea{font:inherit}select{width:100%;padding:10px;border:1px solid #cfd6df;border-radius:9px;margin:10px 0}pre{white-space:pre-wrap;word-break:break-word;background:var(--soft);padding:14px;border-radius:10px;line-height:1.7;margin:10px 0 0}
+.modal{position:fixed;inset:0;background:rgba(15,23,42,.5);display:none;align-items:center;justify-content:center;padding:18px;z-index:50}.modal.open{display:flex}.panel{width:min(760px,100%);max-height:90vh;overflow:auto;background:#fff;border-radius:16px;padding:20px}.panel h2{margin-top:0}label{display:block;font-weight:700;margin:12px 0 6px}input[type=text],textarea{width:100%;padding:11px;border:1px solid #cfd6df;border-radius:9px}textarea{min-height:220px;resize:vertical}.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}.helper{font-size:13px;color:var(--muted);line-height:1.5}.empty{text-align:center;color:var(--muted);padding:40px}.copy-toast{position:fixed;left:50%;bottom:28px;transform:translate(-50%,18px);background:#111827;color:#fff;padding:11px 18px;border-radius:999px;font-weight:700;opacity:0;pointer-events:none;transition:.2s ease;z-index:100;box-shadow:0 10px 30px rgba(15,23,42,.25)}.copy-toast.show{opacity:1;transform:translate(-50%,0)}@media(max-width:650px){.wrap{padding:14px}.grid{grid-template-columns:1fr}h1{font-size:21px}.search{width:100%}}
+</style></head>
+<body>
+<header><div class="wrap top"><div><h1>AROWA Template Manager</h1><p class="sub">Category, template ও product reply এক জায়গা থেকে manage করুন।</p></div><input id="search" class="search" placeholder="Template খুঁজুন..." oninput="render()"></div><div id="nav" class="nav"></div></header>
+<main class="wrap"><div class="toolbar"><div id="count" class="count"></div><button class="secondary" onclick="resetData()">Reset to Default</button></div><div id="grid" class="grid"></div><div id="empty" class="empty" style="display:none">কোনো template পাওয়া যায়নি।</div></main>
+<div id="copyToast" class="copy-toast">✓ কপি হয়েছে</div>
+
+<div id="categoryModal" class="modal"><div class="panel"><h2 id="categoryModalTitle">New Category</h2><label>Category name</label><input id="categoryName" type="text"><div class="modal-actions"><button class="secondary" onclick="closeModal('categoryModal')">Cancel</button><button onclick="saveCategory()">Save</button></div></div></div>
+<div id="templateModal" class="modal"><div class="panel"><h2 id="templateModalTitle">New Template</h2><label>Category</label><select id="templateCategory"></select><label>Template title</label><input id="templateTitle" type="text"><label>Template body</label><textarea id="templateBody"></textarea><p class="helper">Dynamic reply বানাতে placeholders: {{{attar}}}, {{{priceLines}}}, {{{price12}}}, {{{total12}}}, {{{url}}}, {{{longevity}}}, {{{projection}}}। {{attar}} বা {{priceLines}}-সহ যেকোনো product placeholder থাকলে ২৫টি আতরের selector স্বয়ংক্রিয়ভাবে দেখাবে।</p><div class="modal-actions"><button class="secondary" onclick="closeModal('templateModal')">Cancel</button><button onclick="saveTemplate()">Save</button></div></div></div>
+<div id="managerModal" class="modal"><div class="panel"><h2>Edit Category & Template</h2><div id="managerList"></div><div class="modal-actions"><button onclick="closeModal('managerModal')">Done</button></div></div></div>
+<script>
+const attars=[
+{name:"Bianco Latte",url:"https://arowabd.com/bn/products/bianco-latte",longevity:"৬ ঘণ্টা",projection:"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।",prices:[[6,819],[12,1609]]},{name:"Musk Al Tahara",url:"https://arowabd.com/bn/products/musk-al-tahara",longevity:"৬ ঘণ্টা",projection:"শরীরের তাপের সঙ্গে ধীরে ধীরে সুবাস ছড়ায়। ওয়েবসাইটে আলাদা projection rating নেই।",prices:[[6,949],[12,1859]]},{name:"Juicy Apple",url:"https://arowabd.com/bn/products/juicy-apple",longevity:"৫ ঘণ্টা",projection:"ঘ্রাণটি হালকা ও ডেইলি ইউজের উপযোগী। ওয়েবসাইটে আলাদা projection rating নেই।",prices:[[6,500],[12,1000]]},{name:"Aged Ruh Khus",url:"https://arowabd.com/bn/products/aged-ruh-khus",longevity:"২৪ ঘণ্টা",projection:"ত্বকে সাধারণত ৮–১০ ঘণ্টা এবং কাপড়ে ২৪ ঘণ্টারও বেশি সময় ঘ্রাণ থাকে। আলাদা projection rating উল্লেখ নেই।",prices:[[3,1000],[6,1899],[12,3719]]},{name:"Afgani Oud",url:"https://arowabd.com/bn/products/afgani-oud",longevity:"৮ ঘণ্টা",projection:"শুরু থেকেই আলাদা উপস্থিতি তৈরি করে। ওয়েবসাইটে আলাদা projection rating উল্লেখ নেই।",prices:[[6,750],[12,1400]]},{name:"Baccarat Rouge",url:"https://arowabd.com/bn/products/baccarat-rouge",longevity:"৭ ঘণ্টা",projection:"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।",prices:[[6,650],[12,1100]]},{name:"Jafran Musk",url:"https://arowabd.com/bn/products/jafran-musk",longevity:"৭ ঘণ্টা",projection:"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।",prices:[[6,1200],[12,2000]]},{name:"Lavender Oud",url:"https://arowabd.com/bn/products/lavender-oud",longevity:"১০ ঘণ্টা",projection:"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।",prices:[[6,550],[12,1000]]},{name:"Green Royel Ajmeri",url:"https://arowabd.com/bn/products/green-royel-ajmeri",longevity:"৭ ঘণ্টা",projection:"প্রথম দেড় থেকে দুই ঘণ্টা ঘরে সুন্দরভাবে ছড়িয়ে পড়ে। এরপর হালকা উপস্থিতি প্রায় ৭–৮ ঘণ্টা পর্যন্ত টের পাওয়া যেতে পারে।",prices:[[6,850],[12,1450]]},{name:"Ruh Gulab",url:"https://arowabd.com/bn/products/ruh-gulab",longevity:"৮ ঘণ্টা",projection:"ঘ্রাণ দীর্ঘস্থায়ী হলেও কোমল ও হালকা তীব্রতার। আলাদা projection rating উল্লেখ নেই।",prices:[[3,2150],[6,4079],[12,7989]]},{name:"Red Saffron (Jafran)",url:"https://arowabd.com/bn/products/red-saffron-jafran",longevity:"১২ ঘণ্টা",projection:"অল্প কয়েক ফোঁটাই পুরো দিনের জন্য নরম সুবাস ছড়িয়ে রাখতে পারে।",prices:[[6,819],[12,1609]]},{name:"Kasturi",url:"https://arowabd.com/bn/products/kasturi",longevity:"১২ ঘণ্টা",projection:"শুরুতে কড়া ও ভারী, পরে কোমল পাউডারি সুবাসে ধীরে ধীরে চারপাশে ছড়িয়ে পড়ে।",prices:[[3,1190],[6,2259],[12,4419]]},{name:"Black Amber",url:"https://arowabd.com/bn/products/black-amber",longevity:"১২ ঘণ্টা",projection:"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।",prices:[[6,2190],[12,3590]]},{name:"Khamrah Qahwa",url:"https://arowabd.com/bn/products/khamrah-qahwa",longevity:"৮ ঘণ্টা",projection:"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।",prices:[[6,1049],[12,2059]]},{name:"Khamrah",url:"https://arowabd.com/bn/products/khamrah",longevity:"৮ ঘণ্টা",projection:"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।",prices:[[6,1059],[12,2079]]},{name:"White Lotus, Sada Padma",url:"https://arowabd.com/bn/products/white-lotus-absolute",longevity:"১২ ঘণ্টা",projection:"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।",prices:[[3,1400],[6,2649],[12,5199]]},{name:"Musk Al Shafaq",url:"https://arowabd.com/bn/products/musk-al-shafaq",longevity:"১১ ঘণ্টা",projection:"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।",prices:[[6,1349],[12,2639]]},{name:"Wardia Rose",url:"https://arowabd.com/bn/products/wardia-rose",longevity:"তথ্য পাওয়া যায়নি",projection:"অফিশিয়াল product page বর্তমানে fetch করা যায়নি, তাই projection যোগ করা হয়নি।",prices:[[3,2510],[6,4769],[12,9329]]},{name:"Himalayan Deer Musk",url:"https://arowabd.com/bn/products/himalayan-deer-musk",longevity:"তথ্য পাওয়া যায়নি",projection:"অফিশিয়াল product page বর্তমানে fetch করা যায়নি, তাই projection যোগ করা হয়নি।",prices:[[3,9000],[6,17099],[12,33479]]},{name:"Vampire Blood",url:"https://arowabd.com/bn/products/vampire-blood",longevity:"৮ ঘণ্টা",projection:"ওয়েবসাইট অনুযায়ী সুবাস সারা শরীরে সমানভাবে ছড়িয়ে পড়ে।",prices:[[6,550],[12,900]]},{name:"Musk Fakhir",url:"https://arowabd.com/bn/products/musk-fakhir",longevity:"১০ ঘণ্টা",projection:"ওয়েবসাইটের বর্ণনায় দীর্ঘস্থায়ী সুবাস ছড়িয়ে রাখে বলা হয়েছে, তবে আলাদা projection rating নেই।",prices:[[6,1100],[12,2000]]},{name:"Life Partner",url:"https://arowabd.com/bn/products/life-partner",longevity:"৬ ঘণ্টা",projection:"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।",prices:[[6,500],[12,700]]},{name:"Shahi Oud",url:"https://arowabd.com/bn/products/shahi-oud",longevity:"১২ ঘণ্টা",projection:"উদ, চন্দন ও মেশকের রেশ ঘণ্টার পর ঘণ্টা টিকে থাকে। আলাদা projection rating উল্লেখ নেই।",prices:[[6,700],[12,1200]]},{name:"Paris Hilton",url:"https://arowabd.com/bn/products/paris-hilton",longevity:"৭ ঘণ্টা",projection:"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।",prices:[[6,450],[12,750]]},{name:"Marshmallow",url:"https://arowabd.com/bn/products/marshmallow",longevity:"৭ ঘণ্টা",projection:"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।",prices:[[6,550],[12,950]]}
+];
+const defaultData=[
+{name:"Product & Price",items:[
+{title:"নতুন মেসেজ শুরু, আতর ও Price",body:`আসসালামু আলাইকুম স্যার,
+
+{{attar}} আতরঃ
+
+{{priceLines}}
+
+আপনি কত মিলি নিতে চাচ্ছেন?`},
+{title:"অর্ডারের তথ্য + Website Link",body:`অর্ডারটি নিশ্চিত করতে অনুগ্রহ করে নিচের তথ্যগুলো পাঠিয়ে দিন:
+
+নামঃ
+জেলাঃ
+উপজেলা/থানাঃ
+সম্পূর্ণ ঠিকানাঃ
+মোবাইল নম্বরঃ
+
+অথবা {{attar}} আতরটি সরাসরি website থেকে অর্ডার করতে ভিজিট করুনঃ
+{{url}}`},
+{title:"১২ মিলি নিতে চাই",body:`জি স্যার, ইন শা আল্লাহ। ১২ মিলি {{attar}}-এর মূল্য {{price12}}।
+
+অর্ডারটি নিশ্চিত করতে নিচের তথ্যগুলো পাঠিয়ে দিন:
+
+নামঃ
+জেলাঃ
+উপজেলা/থানাঃ
+সম্পূর্ণ ঠিকানাঃ
+মোবাইল নম্বরঃ`},
+{title:"অর্ডার Confirm, ১২ মিলি",body:`জি স্যার, আপনার তথ্যগুলো পেয়েছি। ইন শা আল্লাহ, ১২ মিলি {{attar}} আতরের অর্ডারটি নিশ্চিত করা হয়েছে।
+
+পণ্যের মূল্য: {{price12}}
+ডেলিভারি চার্জ: ৳১৩০
+মোট: {{total12}}
+
+পাঠানোর আগে প্যাকেজিংয়ের ছবি আপনাকে পাঠানো হবে, ইন শা আল্লাহ।`},
+{title:"Mixed Post, Attar + Bag",body:`আসসালামু আলাইকুম স্যার,
+
+{{attar}} আতরঃ
+
+{{priceLines}}
+
+আমাদের যেকোনো ১২ মিলি আতরের সঙ্গে পোস্টে দেখানো প্রিমিয়াম পাউচ ব্যাগটি হাদিয়া হিসেবে দেওয়া হবে।
+
+আপনি কত মিলি নিতে চাচ্ছেন?`},
+{title:"Only Attar Post",body:`আসসালামু আলাইকুম স্যার,
+
+{{attar}} আতরঃ
+
+{{priceLines}}
+
+আপনি কত মিলি নিতে চাচ্ছেন?`},
+{title:"এটা কি আতর?",body:`জি স্যার, এটি {{attar}} আতর।`},
+{title:"এটা কি আতর? Inbox Full",body:`জি স্যার, এটি {{attar}} আতর।
+
+{{priceLines}}
+
+আপনি কত মিলি নিতে চাচ্ছেন?`}
+]},
+{name:"Order & Inbox",items:[
+{title:"অর্ডারের তথ্য চাই",body:`অর্ডারটি নিশ্চিত করতে অনুগ্রহ করে নিচের তথ্যগুলো পাঠিয়ে দিন:
+
+নামঃ
+জেলাঃ
+উপজেলা/থানাঃ
+সম্পূর্ণ ঠিকানাঃ
+মোবাইল নম্বরঃ`},{title:"Public Comment, Price",body:`স্যার, আপনার ইনবক্স চেক করুন।`},{title:"Public Comment, Order",body:`স্যার, ইনবক্স চেক করুন।`},{title:"Order Confirm করব?",body:`আমরা কি আপনার অর্ডারটি নিশ্চিত করে দেব?`},{title:"Address চাই",body:`আপনার সম্পূর্ণ ঠিকানাটি জানিয়ে দিন, তাহলে ডেলিভারি চার্জ কত হবে জানিয়ে দিচ্ছি।`}
+]},
+{name:"Delivery & Return",items:[
+{title:"Delivery Charge",body:`ডেলিভারি চার্জ ৳১৩০।`},
+{title:"ঠিকানা অনুযায়ী Delivery Charge",body:`আপনার সম্পূর্ণ ঠিকানাটি জানিয়ে দিন, তাহলে ডেলিভারি চার্জ কত হবে জানিয়ে দিচ্ছি।`},
+{title:"সারা বাংলাদেশে Delivery",body:`জি স্যার, আমরা সারা বাংলাদেশে হোম ডেলিভারি করে থাকি, ইন শা আল্লাহ।`},
+{title:"Delivery Time",body:`ঢাকার মধ্যে সাধারণত ১–২ দিন এবং ঢাকার বাইরে ২–৪ দিনের মধ্যে ডেলিভারি হয়ে থাকে, ইন শা আল্লাহ।`},
+{title:"Testing Bottle Policy",body:`প্রতিটি অর্ডারের সঙ্গে থাকছে ফ্রি টেস্টিং বোতল। আগে ঘ্রাণ যাচাই করুন, পছন্দ না হলে মূল বোতল সিলবদ্ধ অবস্থায় ফেরত দিলে পলিসি অনুযায়ী রিটার্ন নেওয়া হবে।`},
+{title:"Return Policy",body:`পছন্দ না হলে মূল বোতল সিলবদ্ধ অবস্থায় ফেরত দিতে পারবেন। রিটার্নের ক্ষেত্রে শুধু ডেলিভারি চার্জ দিতে হবে। টেস্টিং বোতলগুলো আপনার কাছেই থাকবে এবং সেগুলোর জন্য কোনো টাকা দিতে হবে না।`},
+{title:"Physical Shop নেই",body:`আমাদের বর্তমানে কোনো ফিজিক্যাল শপ নেই। আমরা অনলাইনের মাধ্যমে সারা বাংলাদেশে হোম ডেলিভারি করে থাকি।`},
+{title:"Packaging Safe",body:`জি স্যার, ইন শা আল্লাহ। বক্সগুলো যেন নষ্ট না হয়, সেভাবেই নিরাপদভাবে প্যাকেজিং করা হবে।`}
+]},
+{name:"Bag & Gift",items:[{title:"৬ মিলিতে Bag আছে?",body:`জি স্যার, Musk Al Tahara-এর ৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।`},{title:"১২ মিলির সঙ্গে Bag",body:`১২ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হবে, ইন শা আল্লাহ।`},{title:"Bag-only Post",body:`আসসালামু আলাইকুম স্যার,
+
+এই প্রিমিয়াম পাউচ ব্যাগটি আলাদাভাবে বিক্রি করা হয় না। আমাদের যেকোনো ১২ মিলি আতরের সঙ্গে হাদিয়া হিসেবে দেওয়া হবে।
+
+আপনি চাইলে ১২ মিলির যেকোনো আতরের দাম ও বিস্তারিত জানিয়ে দিচ্ছি। কোন আতরটি নিতে চাচ্ছেন?`},{title:"দুটি আলাদা Bag",body:`জি স্যার, অবশ্যই। আপনার প্রয়োজন হলে আমরা দুটি আলাদা শপিং ব্যাগ দিয়ে দেব, ইন শা আল্লাহ।`}]},
+{name:"3 ml Policy",items:[{title:"৩ মিলি চাই",body:`আমাদের এখানে ৬/১২ মিলি পাওয়া যাচ্ছে স্যার।
+
+আপনি যদি কোনো আতরের ৬/১২ মিলি অর্ডার করেন তাহলে এর সাথে ৩ মিলির আতর নিতে পারবেন।
+
+এছাড়া একই অথবা ভিন্ন দুটি আতরের ৩+৩ মিলি মিলিয়েও অর্ডার করতে পারবেন।
+
+অন্যথায় আলাদা করে ৩ মিলি দিচ্ছি না স্যার।`}]},
+{name:"Product Details",items:[{title:"Longevity ও Projection, আতর নির্বাচন",body:`{{attar}} আতরঃ
+
+লংজেভিটি: {{longevity}}
+
+প্রজেকশন: {{projection}}
+
+তবে স্থায়িত্ব ও ছড়িয়ে পড়া ত্বকের ধরন, ব্যবহার এবং আবহাওয়ার ওপর কিছুটা কম-বেশি হতে পারে।`}]},
+{name:"Quick Replies",items:[{title:"কথা বুঝিনি",body:`দুঃখিত স্যার, আপনার কথাটি বুঝতে পারিনি। একটু বিস্তারিতভাবে বলবেন?`}]},
+{name:"Follow-up",items:[{title:"Delivery ও Customer Experience Follow-up",body:`প্রিয় স্যার,
+আরোয়া (Arowa) থেকে অর্ডার করার জন্য আন্তরিক ধন্যবাদ।
+
+আপনার অর্ডারকৃত পণ্যের সাথে যে টেস্টিং বোতলটি দেখছেন, মূল বক্স খোলার আগে আপনি এটি ব্যবহার করে আতরের সুবাস ও মান যাচাই করে নিতে পারবেন। আতরটি পছন্দ না হলে মূল বক্স না খুলেই পণ্যটি রিটার্ন করতে পারবেন।
+
+আর হ্যাঁ, শুধু এটুকুই নয়... 🎁 আপনার জন্য আমাদের পক্ষ থেকে ছোট একটি হাদিয়া রইলো — বক্স খুললেই পাবেন দুটি বিশেষ জনপ্রিয় একটি "Life Partner", এবং অন্যটি অন্যতম জনপ্রিয় সুগন্ধি "Bianco Latte"।
+
+ট্রাই করে দেখুন, ইনশাআল্লাহ আপনার পছন্দের তালিকায় নতুন সংযোজন হতে পারে এই দুটি সুগন্ধিও।
+
+শুভকামনা রইলো। আরোয়া পরিবার`}]}
+];
+function normalizePlaceholders(text){
+  return String(text||'').replace(/(?<!\{)\{(attar|priceLines|price12|total12|url|longevity|projection)\}(?!\})/g,'{{$1}}');
+}
+function migrateData(source){
+  return source.map(c=>({...c,items:(c.items||[]).map(it=>({...it,body:normalizePlaceholders(it.body)}))}));
+}
+let data=migrateData(JSON.parse(localStorage.getItem('arowaTemplateDataV2')||'null')||structuredClone(defaultData));let active=0;let editingCategory=null;let editingTemplate=null;
+save();
+function save(){localStorage.setItem('arowaTemplateDataV2',JSON.stringify(data))}
+function money(n){return n==null?'মূল্য পাওয়া যায়নি':'৳'+new Intl.NumberFormat('bn-BD').format(n)}
+function getPrice(a,ml){const x=a.prices.find(p=>p[0]===ml);return x?x[1]:null}
+function priceLines(a){return a.prices.map(([ml,p])=>`${new Intl.NumberFormat('bn-BD').format(ml)} মিলি, ${money(p)}`).join('\n')}
+function isDynamic(body){return /{{(attar|priceLines|price12|total12|url|longevity|projection)}}/.test(body)}
+function fill(body,a){const p12=getPrice(a,12);const map={attar:a.name,priceLines:priceLines(a),price12:money(p12),total12:p12==null?'মূল্য পাওয়া যায়নি':money(p12+130),url:a.url,longevity:a.longevity,projection:a.projection};return body.replace(/{{(attar|priceLines|price12|total12|url|longevity|projection)}}/g,(_,k)=>map[k])}
+const categoryIcons={
+"Product & Price":"🏷️","Order & Inbox":"📥","Delivery & Return":"🚚","Bag & Gift":"🎁","3 ml Policy":"🧴","Product Details":"📋","Quick Replies":"⚡","Follow-up":"🔔"
+};
+function categoryLabel(name){return `${name} ${categoryIcons[name]||"📁"}`}
+async function copyText(text,card){try{await navigator.clipboard.writeText(text)}catch(e){const t=document.createElement('textarea');t.value=text;document.body.appendChild(t);t.select();document.execCommand('copy');t.remove()}if(card){card.classList.add('copy-flash');setTimeout(()=>card.classList.remove('copy-flash'),260)}const toast=document.getElementById('copyToast');toast.classList.add('show');clearTimeout(window.copyToastTimer);window.copyToastTimer=setTimeout(()=>toast.classList.remove('show'),1100)}
+function render(){
+ const nav=document.getElementById('nav'),grid=document.getElementById('grid'),q=document.getElementById('search').value.toLowerCase().trim();
+ nav.innerHTML='';grid.innerHTML='';if(active>=data.length)active=0;
+ data.forEach((c,i)=>{const b=document.createElement('button');b.innerHTML=`${c.name}<span class="cat-icon">${categoryIcons[c.name]||'📁'}</span>`;b.className=i===active?'active':'';b.onclick=()=>{active=i;render()};nav.appendChild(b)});
+ const addCat=document.createElement('button');addCat.className='add-category';addCat.title='New Category';addCat.textContent='+';addCat.onclick=()=>openCategoryModal();nav.appendChild(addCat);
+ if(!data.length){document.getElementById('empty').style.display='block';return}
+ const cat=data[active];let visible=0;
+ cat.items.forEach((item,ii)=>{
+   if(q&&!(`${item.title} ${item.body} ${cat.name}`.toLowerCase().includes(q)))return;
+   visible++;const card=document.createElement('article');card.className='card';const dyn=isDynamic(item.body);
+   card.innerHTML=`<div class="card-head"><div><h3></h3>${dyn?'<span class="tag">২৫টি আতর select করা যাবে</span>':''}</div><div class="mini-actions"><button class="secondary edit">Edit</button></div></div>${dyn?'<select></select>':''}<pre></pre>`;
+   card.querySelector('h3').textContent=item.title;const pre=card.querySelector('pre');let current=item.body;
+   if(dyn){const sel=card.querySelector('select');attars.forEach((a,i)=>{const o=document.createElement('option');o.value=i;o.textContent=`${i+1}. ${a.name}`;sel.appendChild(o)});const update=()=>{current=fill(item.body,attars[+sel.value]);pre.textContent=current};sel.onchange=update;update()}else pre.textContent=current;
+   card.onclick=e=>{if(e.target.closest('select,button,input,textarea,a'))return;copyText(current,card)};card.querySelector('.edit').onclick=e=>{e.stopPropagation();openTemplateModal(active,ii)};grid.appendChild(card)
+ });
+ if(!q){const add=document.createElement('article');add.className='card add-card';add.innerHTML='<div class="add-card-inner"><div class="add-card-plus">+</div><strong>Add New Template</strong><div class="helper">এই category-তে নতুন template যোগ করুন</div></div>';add.onclick=()=>openTemplateModal(active,null);grid.appendChild(add)}
+ document.getElementById('count').textContent=`${categoryLabel(cat.name)} category-তে ${visible}টি template দেখা যাচ্ছে`;document.getElementById('empty').style.display=visible||!q?'none':'block'
+}
+function openCategoryModal(index=null){editingCategory=index;document.getElementById('categoryModalTitle').textContent=index===null?'New Category':'Edit Category';document.getElementById('categoryName').value=index===null?'':data[index].name;document.getElementById('categoryModal').classList.add('open')}
+function saveCategory(){const n=document.getElementById('categoryName').value.trim();if(!n)return alert('Category name লিখুন');if(editingCategory===null)data.push({name:n,items:[]});else data[editingCategory].name=n;save();closeModal('categoryModal');render()}
+function openTemplateModal(ci=null,ii=null){editingTemplate=(ci!==null&&ii!==null)?[ci,ii]:null;const s=document.getElementById('templateCategory');s.innerHTML='';data.forEach((c,i)=>{const o=document.createElement('option');o.value=i;o.textContent=categoryLabel(c.name);s.appendChild(o)});if(!data.length){alert('আগে একটি category তৈরি করুন');return}if(editingTemplate){const item=data[ci].items[ii];document.getElementById('templateModalTitle').textContent='Edit Template';s.value=ci;document.getElementById('templateTitle').value=item.title;document.getElementById('templateBody').value=item.body}else{document.getElementById('templateModalTitle').textContent='New Template';s.value=ci===null?active:ci;document.getElementById('templateTitle').value='';document.getElementById('templateBody').value=''}document.getElementById('templateModal').classList.add('open')}
+function saveTemplate(){const ci=+document.getElementById('templateCategory').value,t=document.getElementById('templateTitle').value.trim(),b=document.getElementById('templateBody').value.trim();if(!t||!b)return alert('Title এবং body লিখুন');if(editingTemplate){const [oldCi,ii]=editingTemplate;const item=data[oldCi].items[ii];data[oldCi].items.splice(ii,1);data[ci].items.push({title:t,body:b})}else data[ci].items.push({title:t,body:b});active=ci;save();closeModal('templateModal');render()}
+function openManager(){const box=document.getElementById('managerList');box.innerHTML='';data.forEach((c,ci)=>{const sec=document.createElement('div');sec.style.borderBottom='1px solid #eee';sec.style.padding='12px 0';sec.innerHTML=`<div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><strong>${categoryLabel(c.name)}</strong><div><button class="secondary">Edit Category</button> <button class="danger">Delete</button></div></div>`;const bs=sec.querySelectorAll('button');bs[0].onclick=()=>{closeModal('managerModal');openCategoryModal(ci)};bs[1].onclick=()=>deleteCategory(ci);c.items.forEach((it,ii)=>{const row=document.createElement('div');row.style.cssText='display:flex;justify-content:space-between;gap:8px;padding:8px 0 0 14px';row.innerHTML=`<span>${it.title}</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div>`;const rb=row.querySelectorAll('button');rb[0].onclick=()=>{closeModal('managerModal');openTemplateModal(ci,ii)};rb[1].onclick=()=>deleteTemplate(ci,ii);sec.appendChild(row)});box.appendChild(sec)});document.getElementById('managerModal').classList.add('open')}
+function deleteCategory(ci){if(!confirm('এই category এবং এর সব template delete করবেন?'))return;data.splice(ci,1);active=0;save();openManager();render()}
+function deleteTemplate(ci,ii){if(!confirm('এই template delete করবেন?'))return;data[ci].items.splice(ii,1);save();openManager();render()}
+function closeModal(id){document.getElementById(id).classList.remove('open')}
+function resetData(){if(confirm('সব custom change মুছে default version ফিরিয়ে আনবেন?')){data=structuredClone(defaultData);active=0;save();render()}}
+render();
+</script></body></html>
