@@ -1,3 +1,4 @@
+
 <!doctype html>
 <html lang="bn">
 <head>
@@ -26,13 +27,22 @@ const attars=[
 ];
 const defaultData=[
 {name:"Product & Price",items:[
-{title:"নতুন মেসেজ শুরু, আতর ও Price",body:`আসসালামু আলাইকুম স্যার,
+{title:"নতুন মেসেজ শুরু, স্যার",body:`আসসালামু আলাইকুম স্যার,
 
-{{attar}} আতরঃ
+এটি হচ্ছে {{attar}} আতরঃ
 
 {{priceLines}}
 
-আপনি কত মিলি নিতে চাচ্ছেন?`},
+প্রতিটি অর্ডারের সঙ্গে থাকছে ফ্রি টেস্টিং বোতল। আগে ঘ্রাণ যাচাই করুন, পছন্দ না হলে মূল বোতল সিলবদ্ধ অবস্থায় ফেরত দিলে পলিসি অনুযায়ী রিটার্ন নেওয়া হবে।
+
+আপনি কত মিলি নিতে চাচ্ছেন, স্যার?`},
+{title:"নতুন মেসেজ শুরু, ম্যাম",body:`ম্যাম! এটি হচ্ছে {{attar}} আতরঃ
+
+{{priceLines}}
+
+প্রতিটি অর্ডারের সঙ্গে থাকছে ফ্রি টেস্টিং বোতল। আগে ঘ্রাণ যাচাই করুন, পছন্দ না হলে মূল বোতল সিলবদ্ধ অবস্থায় ফেরত দিলে পলিসি অনুযায়ী রিটার্ন নেওয়া হবে।
+
+আপনি কত মিলি নিতে চাচ্ছেন, ম্যাম?`},
 {title:"অর্ডারের তথ্য + Website Link",body:`অর্ডারটি নিশ্চিত করতে অনুগ্রহ করে নিচের তথ্যগুলো পাঠিয়ে দিন:
 
 নামঃ
@@ -136,7 +146,35 @@ function normalizePlaceholders(text){
   return String(text||'').replace(/(?<!\{)\{(attar|priceLines|price12|total12|url|longevity|projection)\}(?!\})/g,'{{$1}}');
 }
 function migrateData(source){
-  return source.map(c=>({...c,items:(c.items||[]).map(it=>({...it,body:normalizePlaceholders(it.body)}))}));
+  const migrated=source.map(c=>({...c,items:(c.items||[]).map(it=>({...it,body:normalizePlaceholders(it.body)}))}));
+  const cat=migrated.find(c=>c.name==='Product & Price');
+  if(cat){
+    const oldIndex=cat.items.findIndex(it=>it.title==='নতুন মেসেজ শুরু, আতর ও Price');
+    const sirTemplate={title:'নতুন মেসেজ শুরু, স্যার',body:`আসসালামু আলাইকুম স্যার,
+
+এটি হচ্ছে {{attar}} আতরঃ
+
+{{priceLines}}
+
+প্রতিটি অর্ডারের সঙ্গে থাকছে ফ্রি টেস্টিং বোতল। আগে ঘ্রাণ যাচাই করুন, পছন্দ না হলে মূল বোতল সিলবদ্ধ অবস্থায় ফেরত দিলে পলিসি অনুযায়ী রিটার্ন নেওয়া হবে।
+
+আপনি কত মিলি নিতে চাচ্ছেন, স্যার?`};
+    const mamTemplate={title:'নতুন মেসেজ শুরু, ম্যাম',body:`ম্যাম! এটি হচ্ছে {{attar}} আতরঃ
+
+{{priceLines}}
+
+প্রতিটি অর্ডারের সঙ্গে থাকছে ফ্রি টেস্টিং বোতল। আগে ঘ্রাণ যাচাই করুন, পছন্দ না হলে মূল বোতল সিলবদ্ধ অবস্থায় ফেরত দিলে পলিসি অনুযায়ী রিটার্ন নেওয়া হবে।
+
+আপনি কত মিলি নিতে চাচ্ছেন, ম্যাম?`};
+    if(oldIndex>=0){cat.items.splice(oldIndex,1,sirTemplate,mamTemplate)}
+    else{
+      const sirIndex=cat.items.findIndex(it=>it.title==='নতুন মেসেজ শুরু, স্যার');
+      if(sirIndex>=0)cat.items[sirIndex]=sirTemplate; else cat.items.unshift(sirTemplate);
+      const mamIndex=cat.items.findIndex(it=>it.title==='নতুন মেসেজ শুরু, ম্যাম');
+      if(mamIndex>=0)cat.items[mamIndex]=mamTemplate; else cat.items.splice(1,0,mamTemplate);
+    }
+  }
+  return migrated;
 }
 let data=migrateData(JSON.parse(localStorage.getItem('arowaTemplateDataV2')||'null')||structuredClone(defaultData));let active=0;let editingCategory=null;let editingTemplate=null;
 save();
