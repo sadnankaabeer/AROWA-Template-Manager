@@ -146,7 +146,17 @@ https://arowabd.com/bn/attar
 
 ধরন: {{type}}
 কোথা থেকে আনা হয়েছে: {{region}}`}]},
-{name:"Quick Replies",items:[{title:"কথা বুঝিনি",body:`দুঃখিত স্যার, আপনার কথাটি বুঝতে পারিনি। একটু বিস্তারিতভাবে বলবেন?`}]},
+{name:"Quick Replies",items:[
+{title:"কথা বুঝিনি",body:`দুঃখিত স্যার, আপনার কথাটি বুঝতে পারিনি। একটু বিস্তারিতভাবে বলবেন?`},
+{title:"Price জিজ্ঞেস করলে?",body:`আসসালামু আলাইকুম!
+
+স্যার, আপনি কোন আতরটি নিতে চাচ্ছেন? দয়া করে সেই আতরের ছবি আমাদের সঙ্গে শেয়ার করুন।
+
+ধন্যবাদ।`},
+{title:"Anyone available in chat মেসেজ করলে?",body:`আসসালামু আলাইকুম!
+
+স্যার, বলুন আতর সংক্রান্ত কোন বিষয়ে আপনাকে সহযোগিতা করতে পারি?`}
+]},
 {name:"Follow-up",items:[{title:"Delivery ও Customer Experience Follow-up",body:`প্রিয় স্যার,
 আরোয়া (Arowa) থেকে অর্ডার করার জন্য আন্তরিক ধন্যবাদ।
 
@@ -241,6 +251,27 @@ https://arowabd.com/bn/attar
   let usageCat=migrated.find(c=>c.name==='আতর ব্যবহারের নিয়ম');
   if(!usageCat){migrated.push({name:'আতর ব্যবহারের নিয়ম',items:[usageTemplate]})}
   else if(!usageCat.items.some(x=>x.title===usageTemplate.title)){usageCat.items.push(usageTemplate)}
+
+  const quickTemplates=[
+    {title:'Price জিজ্ঞেস করলে?',body:`আসসালামু আলাইকুম!
+
+স্যার, আপনি কোন আতরটি নিতে চাচ্ছেন? দয়া করে সেই আতরের ছবি আমাদের সঙ্গে শেয়ার করুন।
+
+ধন্যবাদ।`},
+    {title:'Anyone available in chat মেসেজ করলে?',body:`আসসালামু আলাইকুম!
+
+স্যার, বলুন আতর সংক্রান্ত কোন বিষয়ে আপনাকে সহযোগিতা করতে পারি?`}
+  ];
+  let quickCat=migrated.find(c=>c.name==='Quick Replies');
+  if(!quickCat){
+    migrated.push({name:'Quick Replies',items:quickTemplates});
+  }else{
+    quickTemplates.forEach(t=>{
+      const aliases=t.title==='Price জিজ্ঞেস করলে?' ? ['Price জিজ্ঞেস করলে?','দাম জানতে চাইলে','আতরের ছবি চাই'] : ['Anyone available in chat মেসেজ করলে?','চ্যাটে কেউ আগে মেসেজ করলে?','কীভাবে সহযোগিতা করতে পারি?'];
+      const idx=quickCat.items.findIndex(x=>aliases.includes(x.title));
+      if(idx>=0) quickCat.items[idx]=t; else quickCat.items.push(t);
+    });
+  }
   return migrated;
 }
 const savedV5=localStorage.getItem('arowaTemplateDataV5');
