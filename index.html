@@ -1,3 +1,4 @@
+
 <!doctype html>
 <html lang="bn">
 <head>
@@ -13,7 +14,7 @@ header{position:sticky;top:0;z-index:20;background:#fff;border-bottom:1px solid 
 .modal{position:fixed;inset:0;background:rgba(15,23,42,.5);display:none;align-items:center;justify-content:center;padding:18px;z-index:50}.modal.open{display:flex}.panel{width:min(760px,100%);max-height:90vh;overflow:auto;background:#fff;border-radius:16px;padding:20px}.panel h2{margin-top:0}label{display:block;font-weight:700;margin:12px 0 6px}input[type=text],textarea{width:100%;padding:11px;border:1px solid #cfd6df;border-radius:9px}textarea{min-height:220px;resize:vertical}.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}.helper{font-size:13px;color:var(--muted);line-height:1.5}.empty{text-align:center;color:var(--muted);padding:40px}.copy-toast{position:fixed;left:50%;bottom:28px;transform:translate(-50%,18px);background:#111827;color:#fff;padding:11px 18px;border-radius:999px;font-weight:700;opacity:0;pointer-events:none;transition:.2s ease;z-index:100;box-shadow:0 10px 30px rgba(15,23,42,.25)}.copy-toast.show{opacity:1;transform:translate(-50%,0)}@media(max-width:650px){.wrap{padding:14px}.grid{grid-template-columns:1fr}h1{font-size:21px}.search{width:100%}}
 </style></head>
 <body>
-<header><div class="wrap top"><div><h1>AROWA Template Manager</h1><p class="sub">Category, template ও product reply এক জায়গা থেকে manage করুন।</p></div><input id="search" class="search" placeholder="Template খুঁজুন..." oninput="render()"></div><div id="nav" class="nav"></div></header>
+<header><div class="wrap top"><div><h1>AROWA Template Manager</h1><p class="sub">Category, template ও product reply এক জায়গা থেকে manage করুন।</p></div><input id="search" class="search" placeholder="সব category থেকে Template খুঁজুন..." oninput="render()"></div><div id="nav" class="nav"></div></header>
 <main class="wrap"><div class="toolbar"><div id="count" class="count"></div><div style="display:flex;gap:8px"><button class="secondary" onclick="openManager()">Manage / Delete</button><button class="secondary" onclick="resetData()">Reset to Default</button></div></div><div id="grid" class="grid"></div><div id="empty" class="empty" style="display:none">কোনো template পাওয়া যায়নি।</div></main>
 <div id="copyToast" class="copy-toast">✓ কপি হয়েছে</div>
 
@@ -224,6 +225,22 @@ https://arowabd.com/bn/attar
   if(mlCat&&!mlCat.items.some(x=>x.title==='৩ মিলির দাম, আতর নির্বাচন')){
     mlCat.items.push({title:'৩ মিলির দাম, আতর নির্বাচন',body:`জি স্যার, {{attar}} আতর ৩ মিলির মূল্য {{price3ml}}।`});
   }
+  const usageTemplate={title:'আতর ব্যবহারের নিয়ম (৪ ধাপ)',body:`আতর ব্যবহারের নিয়মঃ
+
+০১. অল্প পরিমাণ ব্যবহার করুন
+আতর কনসেনট্রেটেড হওয়ায় খুব অল্প পরিমাণই যথেষ্ট। কব্জিতে এক ফোঁটা দিয়ে শুরু করুন।
+
+০২. পালস পয়েন্টে লাগান
+কব্জি, ঘাড়ের পাশে বা কানের পেছনে লাগালে শরীরের স্বাভাবিক উষ্ণতায় ঘ্রাণ ধীরে ধীরে সুন্দরভাবে ছড়ায়।
+
+০৩. লাগানোর পর ঘষবেন না
+আতর লাগিয়ে দুই কব্জি ঘষবেন না। এতে ঘ্রাণের স্বাভাবিক স্তর নষ্ট হতে পারে। আলতোভাবে ছুঁয়ে দিলেই যথেষ্ট।
+
+০৪. সঠিকভাবে সংরক্ষণ করুন
+বোতলটি সরাসরি রোদ, অতিরিক্ত গরম ও আর্দ্রতা থেকে দূরে ঠান্ডা ও অন্ধকার জায়গায় রাখুন। এতে আতরের মান ও ঘ্রাণ দীর্ঘদিন ভালো থাকবে।`};
+  let usageCat=migrated.find(c=>c.name==='আতর ব্যবহারের নিয়ম');
+  if(!usageCat){migrated.push({name:'আতর ব্যবহারের নিয়ম',items:[usageTemplate]})}
+  else if(!usageCat.items.some(x=>x.title===usageTemplate.title)){usageCat.items.push(usageTemplate)}
   return migrated;
 }
 const savedV5=localStorage.getItem('arowaTemplateDataV5');
@@ -245,27 +262,48 @@ const categoryIcons={
 function categoryLabel(name){return `${name} ${categoryIcons[name]||"📁"}`}
 async function copyText(text,card){try{await navigator.clipboard.writeText(text)}catch(e){const t=document.createElement('textarea');t.value=text;document.body.appendChild(t);t.select();document.execCommand('copy');t.remove()}if(card){card.classList.add('copy-flash');setTimeout(()=>card.classList.remove('copy-flash'),260)}const toast=document.getElementById('copyToast');toast.classList.add('show');clearTimeout(window.copyToastTimer);window.copyToastTimer=setTimeout(()=>toast.classList.remove('show'),1100)}
 function render(){
- const nav=document.getElementById('nav'),grid=document.getElementById('grid'),q=document.getElementById('search').value.toLowerCase().trim();
+ const nav=document.getElementById('nav'),grid=document.getElementById('grid'),searchInput=document.getElementById('search');
+ const q=searchInput.value.toLocaleLowerCase('bn-BD').trim();
  nav.innerHTML='';grid.innerHTML='';if(active>=data.length)active=0;
- data.forEach((c,i)=>{const b=document.createElement('button');b.innerHTML=`${c.name}<span class="cat-icon">${categoryIcons[c.name]||'📁'}</span>`;b.className=i===active?'active':'';b.onclick=()=>{active=i;render()};nav.appendChild(b)});
+ data.forEach((c,i)=>{const b=document.createElement('button');b.innerHTML=`${c.name}<span class="cat-icon">${categoryIcons[c.name]||'📁'}</span>`;b.className=!q&&i===active?'active':'';b.onclick=()=>{active=i;searchInput.value='';render()};nav.appendChild(b)});
  const addCat=document.createElement('button');addCat.className='add-category';addCat.title='New Category';addCat.textContent='+';addCat.onclick=()=>openCategoryModal();nav.appendChild(addCat);
- if(!data.length){document.getElementById('empty').style.display='block';return}
- const cat=data[active];let visible=0;
- cat.items.forEach((item,ii)=>{
-   if(q&&!(`${item.title} ${item.body} ${cat.name}`.toLowerCase().includes(q)))return;
-   visible++;const card=document.createElement('article');card.className='card';card.draggable=!q;card.dataset.index=ii;card.title=q?'Search চলাকালে reorder বন্ধ থাকে':'Hold করে drag করলে template-এর position পরিবর্তন হবে';const dyn=isDynamic(item.body);
-   card.innerHTML=`<div class="card-head"><div><h3></h3>${dyn?`<span class="tag">${attars.length}টি আতর select করা যাবে</span>`:''}</div><div class="mini-actions"><button class="secondary edit">Edit</button></div></div>${dyn?'<select></select>':''}<pre></pre>`;
+ if(!data.length){document.getElementById('empty').style.display='block';document.getElementById('count').textContent='কোনো category নেই';return}
+
+ const entries=[];
+ if(q){
+   data.forEach((cat,ci)=>cat.items.forEach((item,ii)=>{
+     const searchable=`${cat.name} ${item.title} ${item.body}`.toLocaleLowerCase('bn-BD');
+     if(searchable.includes(q))entries.push({cat,ci,item,ii});
+   }));
+ }else{
+   const cat=data[active];cat.items.forEach((item,ii)=>entries.push({cat,ci:active,item,ii}));
+ }
+
+ entries.forEach(({cat,ci,item,ii})=>{
+   const card=document.createElement('article');card.className='card';card.draggable=!q;card.dataset.index=ii;
+   card.title=q?'Search result':'Hold করে drag করলে template-এর position পরিবর্তন হবে';
+   const dyn=isDynamic(item.body);
+   card.innerHTML=`<div class="card-head"><div><h3></h3>${q?`<span class="tag">${categoryLabel(cat.name)}</span>`:''}${dyn?`<span class="tag">${attars.length}টি আতর select করা যাবে</span>`:''}</div><div class="mini-actions"><button class="secondary edit">Edit</button></div></div>${dyn?'<select></select>':''}<pre></pre>`;
    card.querySelector('h3').textContent=item.title;const pre=card.querySelector('pre');let current=item.body;
-   if(dyn){const sel=card.querySelector('select');attars.forEach((a,i)=>{const o=document.createElement('option');o.value=i;o.textContent=`${i+1}. ${a.name}`;sel.appendChild(o)});const update=()=>{current=fill(item.body,attars[+sel.value]);pre.textContent=current};sel.onchange=update;update()}else{current=fillGlobal(item.body);pre.textContent=current;}
-   card.addEventListener('dragstart',e=>{if(q){e.preventDefault();return}dragState={category:active,index:ii};suppressCopyUntil=Date.now()+700;card.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',String(ii))});
-   card.addEventListener('dragover',e=>{if(!dragState||dragState.category!==active||q)return;e.preventDefault();e.dataTransfer.dropEffect='move';card.classList.add('drag-over')});
+   if(dyn){
+     const sel=card.querySelector('select');
+     attars.forEach((a,i)=>{const o=document.createElement('option');o.value=i;o.textContent=`${i+1}. ${a.name}`;sel.appendChild(o)});
+     const update=()=>{current=fill(item.body,attars[+sel.value]);pre.textContent=current};sel.onchange=update;update();
+   }else{current=fillGlobal(item.body);pre.textContent=current;}
+   card.addEventListener('dragstart',e=>{if(q){e.preventDefault();return}dragState={category:ci,index:ii};suppressCopyUntil=Date.now()+700;card.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',String(ii))});
+   card.addEventListener('dragover',e=>{if(!dragState||dragState.category!==ci||q)return;e.preventDefault();e.dataTransfer.dropEffect='move';card.classList.add('drag-over')});
    card.addEventListener('dragleave',()=>card.classList.remove('drag-over'));
-   card.addEventListener('drop',e=>{if(!dragState||dragState.category!==active||q)return;e.preventDefault();card.classList.remove('drag-over');const from=dragState.index,to=ii;if(from!==to){const [moved]=data[active].items.splice(from,1);data[active].items.splice(to,0,moved);save()}dragState=null;suppressCopyUntil=Date.now()+700;render()});
+   card.addEventListener('drop',e=>{if(!dragState||dragState.category!==ci||q)return;e.preventDefault();card.classList.remove('drag-over');const from=dragState.index,to=ii;if(from!==to){const [moved]=data[ci].items.splice(from,1);data[ci].items.splice(to,0,moved);save()}dragState=null;suppressCopyUntil=Date.now()+700;render()});
    card.addEventListener('dragend',()=>{card.classList.remove('dragging','drag-over');dragState=null;suppressCopyUntil=Date.now()+500});
-   card.onclick=e=>{if(Date.now()<suppressCopyUntil||e.target.closest('select,button,input,textarea,a'))return;copyText(current,card)};card.querySelector('.edit').onclick=e=>{e.stopPropagation();openTemplateModal(active,ii)};grid.appendChild(card)
+   card.onclick=e=>{if(Date.now()<suppressCopyUntil||e.target.closest('select,button,input,textarea,a'))return;copyText(current,card)};
+   card.querySelector('.edit').onclick=e=>{e.stopPropagation();openTemplateModal(ci,ii)};
+   grid.appendChild(card);
  });
+
  if(!q){const add=document.createElement('article');add.className='card add-card';add.innerHTML='<div class="add-card-inner"><div class="add-card-plus">+</div><strong>Add New Template</strong><div class="helper">এই category-তে নতুন template যোগ করুন</div></div>';add.onclick=()=>openTemplateModal(active,null);grid.appendChild(add)}
- document.getElementById('count').textContent=`${categoryLabel(cat.name)} category-তে ${visible}টি template দেখা যাচ্ছে`;document.getElementById('empty').style.display=visible||!q?'none':'block'
+ const count=document.getElementById('count');
+ count.textContent=q?`“${searchInput.value.trim()}” এর জন্য ${entries.length}টি template পাওয়া গেছে`:`${categoryLabel(data[active].name)} category-তে ${entries.length}টি template দেখা যাচ্ছে`;
+ document.getElementById('empty').style.display=entries.length?'none':'block';
 }
 function openCategoryModal(index=null){editingCategory=index;document.getElementById('categoryModalTitle').textContent=index===null?'New Category':'Edit Category';document.getElementById('categoryName').value=index===null?'':data[index].name;document.getElementById('categoryModal').classList.add('open')}
 function saveCategory(){const n=document.getElementById('categoryName').value.trim();if(!n)return alert('Category name লিখুন');if(editingCategory===null)data.push({name:n,items:[]});else data[editingCategory].name=n;save();closeModal('categoryModal');render()}
@@ -276,5 +314,6 @@ function deleteCategory(ci){if(!confirm('এই category এবং এর সব
 function deleteTemplate(ci,ii){if(!confirm('এই template delete করবেন?'))return;data[ci].items.splice(ii,1);save();openManager();render()}
 function closeModal(id){document.getElementById(id).classList.remove('open')}
 function resetData(){if(confirm('সব custom change মুছে default version ফিরিয়ে আনবেন?')){data=structuredClone(defaultData);active=0;save();render()}}
+document.getElementById('search').addEventListener('keydown',e=>{if(e.key==='Escape'){e.target.value='';render()}});
 render();
 </script></body></html>
