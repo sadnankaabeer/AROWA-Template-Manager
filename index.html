@@ -14,7 +14,7 @@ header{position:sticky;top:0;z-index:20;background:#fff;border-bottom:1px solid 
 .modal{position:fixed;inset:0;background:rgba(15,23,42,.5);display:none;align-items:center;justify-content:center;padding:18px;z-index:50}.modal.open{display:flex}.panel{width:min(760px,100%);max-height:90vh;overflow:auto;background:#fff;border-radius:16px;padding:20px}.panel h2{margin-top:0}label{display:block;font-weight:700;margin:12px 0 6px}input[type=text],textarea{width:100%;padding:11px;border:1px solid #cfd6df;border-radius:9px}textarea{min-height:220px;resize:vertical}.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}.helper{font-size:13px;color:var(--muted);line-height:1.5}.empty{text-align:center;color:var(--muted);padding:40px}.copy-toast{position:fixed;left:50%;bottom:28px;transform:translate(-50%,18px);background:#111827;color:#fff;padding:11px 18px;border-radius:999px;font-weight:700;opacity:0;pointer-events:none;transition:.2s ease;z-index:100;box-shadow:0 10px 30px rgba(15,23,42,.25)}.copy-toast.show{opacity:1;transform:translate(-50%,0)}@media(max-width:650px){.wrap{padding:14px}.grid{grid-template-columns:1fr}h1{font-size:21px}.search{width:100%}}
 </style></head>
 <body>
-<header><div class="wrap top"><div><h1>AROWA Template Manager</h1><p class="sub">Category, template ও product reply এক জায়গা থেকে manage করুন।</p></div><input id="search" class="search" placeholder="সব category থেকে Template খুঁজুন..." oninput="render()"></div><div id="nav" class="nav"></div></header>
+<header><div class="wrap top"><div><h1>AROWA Template Manager</h1><p class="sub">Product, order, inbox ও support reply এক জায়গা থেকে manage করুন।</p></div><input id="search" class="search" placeholder="সব category থেকে Template খুঁজুন..." oninput="render()"></div><div id="nav" class="nav"></div></header>
 <main class="wrap"><div class="toolbar"><div id="count" class="count"></div><div style="display:flex;gap:8px"><button class="secondary" onclick="openManager()">Manage / Delete</button><button class="secondary" onclick="resetData()">Reset to Default</button></div></div><div id="grid" class="grid"></div><div id="empty" class="empty" style="display:none">কোনো template পাওয়া যায়নি।</div></main>
 <div id="copyToast" class="copy-toast">✓ কপি হয়েছে</div>
 
@@ -106,7 +106,16 @@ https://arowabd.com/bn/attar
 জেলাঃ
 উপজেলা/থানাঃ
 সম্পূর্ণ ঠিকানাঃ
-মোবাইল নম্বরঃ`},{title:"Public Comment, Price",body:`স্যার, আপনার ইনবক্স চেক করুন।`},{title:"Public Comment, Order",body:`স্যার, ইনবক্স চেক করুন।`},{title:"Order Confirm করব?",body:`আমরা কি আপনার অর্ডারটি নিশ্চিত করে দেব?`},{title:"Address চাই",body:`আপনার সম্পূর্ণ ঠিকানাটি জানিয়ে দিন, তাহলে ডেলিভারি চার্জ কত হবে জানিয়ে দিচ্ছি।`}
+মোবাইল নম্বরঃ`},{title:"Public Comment, Price",body:`স্যার, আপনার ইনবক্স চেক করুন।`},{title:"Public Comment, Order",body:`স্যার, ইনবক্স চেক করুন।`},{title:"Order Confirm করব?",body:`আমরা কি আপনার অর্ডারটি নিশ্চিত করে দেব?`},{title:"Address চাই",body:`আপনার সম্পূর্ণ ঠিকানাটি জানিয়ে দিন, তাহলে ডেলিভারি চার্জ কত হবে জানিয়ে দিচ্ছি।`},
+{title:"Price জিজ্ঞেস করলে?",body:`আসসালামু আলাইকুম!
+
+স্যার, আপনি কোন আতরটি নিতে চাচ্ছেন? দয়া করে সেই আতরের ছবি আমাদের সঙ্গে শেয়ার করুন।
+
+ধন্যবাদ।`},
+{title:"Anyone available in chat মেসেজ করলে?",body:`আসসালামু আলাইকুম!
+
+স্যার, বলুন আতর সংক্রান্ত কোন বিষয়ে আপনাকে সহযোগিতা করতে পারি?`},
+{title:"কথা বুঝিনি",body:`দুঃখিত স্যার, আপনার কথাটি বুঝতে পারিনি। একটু বিস্তারিতভাবে বলবেন?`}
 ]},
 {name:"Delivery & Return",items:[
 {title:"Delivery Charge",body:`ডেলিভারি চার্জ ৳১৩০।`},
@@ -146,17 +155,6 @@ https://arowabd.com/bn/attar
 
 ধরন: {{type}}
 কোথা থেকে আনা হয়েছে: {{region}}`}]},
-{name:"Quick Replies",items:[
-{title:"কথা বুঝিনি",body:`দুঃখিত স্যার, আপনার কথাটি বুঝতে পারিনি। একটু বিস্তারিতভাবে বলবেন?`},
-{title:"Price জিজ্ঞেস করলে?",body:`আসসালামু আলাইকুম!
-
-স্যার, আপনি কোন আতরটি নিতে চাচ্ছেন? দয়া করে সেই আতরের ছবি আমাদের সঙ্গে শেয়ার করুন।
-
-ধন্যবাদ।`},
-{title:"Anyone available in chat মেসেজ করলে?",body:`আসসালামু আলাইকুম!
-
-স্যার, বলুন আতর সংক্রান্ত কোন বিষয়ে আপনাকে সহযোগিতা করতে পারি?`}
-]},
 {name:"Follow-up",items:[{title:"Delivery ও Customer Experience Follow-up",body:`প্রিয় স্যার,
 আরোয়া (Arowa) থেকে অর্ডার করার জন্য আন্তরিক ধন্যবাদ।
 
@@ -252,7 +250,7 @@ https://arowabd.com/bn/attar
   if(!usageCat){migrated.push({name:'আতর ব্যবহারের নিয়ম',items:[usageTemplate]})}
   else if(!usageCat.items.some(x=>x.title===usageTemplate.title)){usageCat.items.push(usageTemplate)}
 
-  const quickTemplates=[
+  const inboxTemplates=[
     {title:'Price জিজ্ঞেস করলে?',body:`আসসালামু আলাইকুম!
 
 স্যার, আপনি কোন আতরটি নিতে চাচ্ছেন? দয়া করে সেই আতরের ছবি আমাদের সঙ্গে শেয়ার করুন।
@@ -260,18 +258,40 @@ https://arowabd.com/bn/attar
 ধন্যবাদ।`},
     {title:'Anyone available in chat মেসেজ করলে?',body:`আসসালামু আলাইকুম!
 
-স্যার, বলুন আতর সংক্রান্ত কোন বিষয়ে আপনাকে সহযোগিতা করতে পারি?`}
+স্যার, বলুন আতর সংক্রান্ত কোন বিষয়ে আপনাকে সহযোগিতা করতে পারি?`},
+    {title:'কথা বুঝিনি',body:`দুঃখিত স্যার, আপনার কথাটি বুঝতে পারিনি। একটু বিস্তারিতভাবে বলবেন?`}
   ];
-  let quickCat=migrated.find(c=>c.name==='Quick Replies');
-  if(!quickCat){
-    migrated.push({name:'Quick Replies',items:quickTemplates});
-  }else{
-    quickTemplates.forEach(t=>{
-      const aliases=t.title==='Price জিজ্ঞেস করলে?' ? ['Price জিজ্ঞেস করলে?','দাম জানতে চাইলে','আতরের ছবি চাই'] : ['Anyone available in chat মেসেজ করলে?','চ্যাটে কেউ আগে মেসেজ করলে?','কীভাবে সহযোগিতা করতে পারি?'];
-      const idx=quickCat.items.findIndex(x=>aliases.includes(x.title));
-      if(idx>=0) quickCat.items[idx]=t; else quickCat.items.push(t);
-    });
+
+  let orderCat=migrated.find(c=>c.name==='Order & Inbox');
+  if(!orderCat){
+    orderCat={name:'Order & Inbox',items:[]};
+    migrated.push(orderCat);
   }
+
+  const quickIndex=migrated.findIndex(c=>c.name==='Quick Replies');
+  if(quickIndex>=0){
+    const quickItems=migrated[quickIndex].items||[];
+    quickItems.forEach(item=>{
+      if(!orderCat.items.some(x=>x.title===item.title)) orderCat.items.push(item);
+    });
+    migrated.splice(quickIndex,1);
+  }
+
+  inboxTemplates.forEach(t=>{
+    const aliases=t.title==='Price জিজ্ঞেস করলে?'
+      ? ['Price জিজ্ঞেস করলে?','দাম জানতে চাইলে','আতরের ছবি চাই']
+      : t.title==='Anyone available in chat মেসেজ করলে?'
+        ? ['Anyone available in chat মেসেজ করলে?','চ্যাটে কেউ আগে মেসেজ করলে?','কীভাবে সহযোগিতা করতে পারি?']
+        : ['কথা বুঝিনি'];
+    const idx=orderCat.items.findIndex(x=>aliases.includes(x.title));
+    if(idx>=0) orderCat.items[idx]=t; else orderCat.items.push(t);
+  });
+
+  const categoryOrder=['Product & Price','Order & Inbox','Delivery & Return','Bag & Gift','3 ml Policy','Product Details','আতর ব্যবহারের নিয়ম','Follow-up'];
+  migrated.sort((a,b)=>{
+    const ai=categoryOrder.indexOf(a.name), bi=categoryOrder.indexOf(b.name);
+    return (ai<0?999:ai)-(bi<0?999:bi);
+  });
   return migrated;
 }
 const savedV5=localStorage.getItem('arowaTemplateDataV5');
@@ -288,7 +308,7 @@ function fillGlobal(body){const map={allAttars:allAttarsText(),allPrices:allPric
 function isDynamic(body){return /{{(attar|priceLines|price3ml|price12|total12|url|longevity|projection|type|region|bagPolicy)}}/.test(body)}
 function fill(body,a){const p3=getPrice(a,3),p12=getPrice(a,12);const map={attar:a.name,priceLines:priceLines(a),price3ml:money(p3),price12:money(p12),total12:p12==null?'মূল্য পাওয়া যায়নি':money(p12+130),url:a.url||'Website link পাওয়া যায়নি',longevity:a.longevity,projection:a.projection,type:a.type,region:a.region,bagPolicy:a.bagPolicy};return fillGlobal(body.replace(/{{(attar|priceLines|price3ml|price12|total12|url|longevity|projection|type|region|bagPolicy)}}/g,(_,k)=>map[k]))}
 const categoryIcons={
-"Product & Price":"🏷️","Order & Inbox":"📥","Delivery & Return":"🚚","Bag & Gift":"🎁","3 ml Policy":"🧴","Product Details":"📋","Quick Replies":"⚡","Follow-up":"🔔","আতর ব্যবহারের নিয়ম":"📖"
+"Product & Price":"🏷️","Order & Inbox":"📥","Delivery & Return":"🚚","Bag & Gift":"🎁","3 ml Policy":"🧴","Product Details":"📋","Follow-up":"🔔","আতর ব্যবহারের নিয়ম":"📖"
 };
 function categoryLabel(name){return `${name} ${categoryIcons[name]||"📁"}`}
 async function copyText(text,card){try{await navigator.clipboard.writeText(text)}catch(e){const t=document.createElement('textarea');t.value=text;document.body.appendChild(t);t.select();document.execCommand('copy');t.remove()}if(card){card.classList.add('copy-flash');setTimeout(()=>card.classList.remove('copy-flash'),260)}const toast=document.getElementById('copyToast');toast.classList.add('show');clearTimeout(window.copyToastTimer);window.copyToastTimer=setTimeout(()=>toast.classList.remove('show'),1100)}
