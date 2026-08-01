@@ -1,5 +1,363 @@
 <!doctype html>
 <html lang="bn"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AROWA Support Template Manager</title>
 <style>
@@ -14,59 +372,37 @@ header{position:sticky;top:0;z-index:20;background:#fff;border-bottom:1px solid 
 
 .search-wrap{position:relative;width:min(430px,100%)}.search-wrap .search{width:100%;padding-right:48px}.search-filter-btn{position:absolute;right:5px;top:5px;width:38px;height:38px;padding:0;border-radius:8px;background:#fff;color:#344054;border:1px solid var(--line);font-size:17px}.search-filter-btn.active{background:var(--brand);color:#fff}.search-filters{position:absolute;right:0;top:calc(100% + 8px);width:min(560px,94vw);background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px;box-shadow:0 14px 34px rgba(15,23,42,.18);display:none;z-index:45}.search-filters.open{display:block}.search-filter-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.search-filter-grid select,.search-filter-grid input{margin:0;width:100%;padding:10px;border:1px solid #cfd6df;border-radius:9px;background:#fff}.search-filter-actions{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:10px}.search-filter-note{font-size:12px;color:var(--muted)}.result-section-title{grid-column:1/-1;font-size:14px;font-weight:800;color:#475467;margin-top:2px}.attar-result{background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px;box-shadow:0 4px 18px rgba(15,23,42,.045);cursor:pointer}.attar-result:hover{transform:translateY(-2px);border-color:#aab4c3;box-shadow:0 8px 24px rgba(15,23,42,.09)}.attar-result h3{margin:0 0 8px;font-size:17px}.attar-meta{font-size:13px;color:var(--muted);line-height:1.55}.attar-price{font-weight:800;margin-top:10px}.smell-badge{display:inline-block;margin-left:6px;padding:3px 7px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:11px;font-weight:700}@media(max-width:650px){.search-wrap{width:100%}.search-filter-grid{grid-template-columns:1fr}}
 @media(max-width:650px){.wrap{padding:14px}.grid{grid-template-columns:1fr}h1{font-size:21px}.search{width:100%}}
+.price-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.price-grid label{margin:0 0 6px}
 </style></head>
-<body>
-<header><div class="wrap top"><div><h1>AROWA Template Manager</h1><p class="sub">Product, order, inbox ও support reply এক জায়গা থেকে manage করুন।</p></div><div class="search-wrap" id="searchWrap"><input id="search" class="search" placeholder="Template, আতর, ঘ্রাণ বা দাম খুঁজুন..." oninput="render()"><button class="search-filter-btn" id="searchFilterBtn" onclick="toggleSearchFilters(event)" title="Search filters">⚙</button><div class="search-filters" id="searchFilters"><div class="search-filter-grid"><select id="smellLevel" onchange="render()"><option value="">সব ঘ্রাণ</option><option value="light">হালকা ঘ্রাণ</option><option value="medium">মাঝারি ঘ্রাণ</option><option value="strong">ঘাড়ো / শক্ত ঘ্রাণ</option></select><select id="mlFilter" onchange="render()"><option value="">সব মিলি</option><option value="3">৩ মিলি</option><option value="6">৬ মিলি</option><option value="12">১২ মিলি</option></select><input id="minPrice" type="number" min="0" placeholder="সর্বনিম্ন দাম" oninput="render()"><input id="maxPrice" type="number" min="0" placeholder="সর্বোচ্চ দাম" oninput="render()"><select id="typeFilter" onchange="render()"><option value="">সব ধরন</option><option value="100% Pure">100% Pure</option><option value="Synthetic">Synthetic</option></select><select id="sortFilter" onchange="render()"><option value="">Default sorting</option><option value="priceAsc">দাম কম থেকে বেশি</option><option value="priceDesc">দাম বেশি থেকে কম</option></select></div><div class="search-filter-actions"><span class="search-filter-note">একই search bar থেকে template ও আতর দুটোই খুঁজবে</span><button class="secondary" onclick="clearSearchFilters(event)">Clear filters</button></div></div></div></div><div id="nav" class="nav"><button class="">Product &amp; Price<span class="cat-icon">🏷️</span></button><button class="">Order &amp; Inbox<span class="cat-icon">📥</span></button><button class="">Delivery &amp; Return<span class="cat-icon">🚚</span></button><button class="">Bag &amp; Gift<span class="cat-icon">🎁</span></button><button class="">3 ml Policy<span class="cat-icon">🧴</span></button><button class="active">Product Details<span class="cat-icon">📋</span></button><button class="">আতর ব্যবহারের নিয়ম<span class="cat-icon">📖</span></button><button class="">Follow-up<span class="cat-icon">🔔</span></button><button class="add-category" title="New Category">+</button></div></header>
-<main class="wrap"><div class="toolbar"><div id="count" class="count">Search result: 0টি আতর, 4টি template</div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="secondary" onclick="openManager()">Manage / Delete</button><div class="export-menu" id="exportMenu"><button class="secondary" onclick="openHtmlExport()">Copy HTML Code</button><button class="secondary export-menu-toggle" onclick="toggleExportMenu(event)" title="More options">▾</button><div class="export-dropdown" id="exportDropdown"><a href="https://github.com/sadnankaabeer/AROWA-Template-Manager/edit/main/index.html" target="_blank" rel="noopener noreferrer">Edit GitHub</a></div></div><button class="secondary" onclick="resetData()">Reset to Default</button><span id="reloadStatus" class="reload-status">Auto reload: on</span></div></div><div id="grid" class="grid"><article class="card" draggable="true" data-index="0" title="Hold করে drag করলে template-এর position পরিবর্তন হবে"><div class="card-head"><div><h3>Longevity ও Projection, আতর নির্বাচন</h3><span class="tag">29টি আতর select করা যাবে</span></div><div class="mini-actions"><button class="secondary edit">Edit</button></div></div><select><option value="0">1. Musk Al Tahara</option><option value="1">2. Musk Al Shafaq</option><option value="2">3. Khamrah</option><option value="3">4. Khamrah Qawa</option><option value="4">5. Bianco Latte</option><option value="5">6. Saffron</option><option value="6">7. Ruh Khus</option><option value="7">8. White/Absolute Lotus</option><option value="8">9. Kasturi</option><option value="9">10. Kasturi - Deer Musk</option><option value="10">11. Black Rose</option><option value="11">12. Ruh Gulab (100% Pure)</option><option value="12">13. Ruh Gulab (Synthetic)</option><option value="13">14. Moroccan Rose</option><option value="14">15. Palanpuri Rose</option><option value="15">16. Wardia Crystal Rose</option><option value="16">17. Smoky Oud</option><option value="17">18. Rose de Mai</option><option value="18">19. Oud - Sylheti</option><option value="19">20. Oud - Sylheti (Dehn Al Oud)</option><option value="20">21. Dehn Al Oud Suyufi</option><option value="21">22. Amber Oudh</option><option value="22">23. Mesk e Amber</option><option value="23">24. Mysore Sandal</option><option value="24">25. Baccarat Rouge</option><option value="25">26. Vampire Blood</option><option value="26">27. Musk Fakhir</option><option value="27">28. Jafran Musk</option><option value="28">29. Paris Hilton</option></select><pre>Musk Al Tahara আতরঃ
+<body id="artifacts-component-root-html">
+<header><div class="wrap top"><div><h1>AROWA Template Manager</h1><p class="sub">Product, order, inbox ও support reply এক জায়গা থেকে manage করুন।</p></div><div class="search-wrap" id="searchWrap"><input id="search" class="search" placeholder="Template, আতর, ঘ্রাণ বা দাম খুঁজুন..." oninput="render()"><button class="search-filter-btn" id="searchFilterBtn" onclick="toggleSearchFilters(event)" title="Search filters">⚙</button><div class="search-filters" id="searchFilters"><div class="search-filter-grid"><select id="smellLevel" onchange="render()"><option value="">সব ঘ্রাণ</option><option value="light">হালকা ঘ্রাণ</option><option value="medium">মাঝারি ঘ্রাণ</option><option value="strong">ঘাড়ো / শক্ত ঘ্রাণ</option></select><select id="mlFilter" onchange="render()"><option value="">সব মিলি</option><option value="3">৩ মিলি</option><option value="6">৬ মিলি</option><option value="12">১২ মিলি</option></select><input id="minPrice" type="number" min="0" placeholder="সর্বনিম্ন দাম" oninput="render()"><input id="maxPrice" type="number" min="0" placeholder="সর্বোচ্চ দাম" oninput="render()"><select id="typeFilter" onchange="render()"><option value="">সব ধরন</option><option value="100% Pure">100% Pure</option><option value="Synthetic">Synthetic</option></select><select id="sortFilter" onchange="render()"><option value="">Default sorting</option><option value="priceAsc">দাম কম থেকে বেশি</option><option value="priceDesc">দাম বেশি থেকে কম</option></select></div><div class="search-filter-actions"><span class="search-filter-note">একই search bar থেকে template ও আতর দুটোই খুঁজবে</span><button class="secondary" onclick="clearSearchFilters(event)">Clear filters</button></div></div></div></div><div id="nav" class="nav"><button class="">Product &amp; Price<span class="cat-icon">🏷️</span></button><button class="">Order &amp; Inbox<span class="cat-icon">📥</span></button><button class="">Delivery &amp; Return<span class="cat-icon">🚚</span></button><button class="">Bag &amp; Gift<span class="cat-icon">🎁</span></button><button class="">3 ml Policy<span class="cat-icon">🧴</span></button><button class="">Product Details<span class="cat-icon">📋</span></button><button class="active">আতর ব্যবহারের নিয়ম<span class="cat-icon">📖</span></button><button class="">Follow-up<span class="cat-icon">🔔</span></button><button class="add-category" title="New Category">+</button></div></header>
+<main class="wrap"><div class="toolbar"><div id="count" class="count">আতর ব্যবহারের নিয়ম 📖 category-তে 1টি template দেখা যাচ্ছে</div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="secondary" onclick="openAttarManager()">Manage Attars</button><button class="secondary" onclick="openManager()">Manage / Delete</button><div class="export-menu" id="exportMenu"><button class="secondary" onclick="openHtmlExport()">Copy HTML Code</button><button class="secondary export-menu-toggle" onclick="toggleExportMenu(event)" title="More options">▾</button><div class="export-dropdown" id="exportDropdown"><a href="https://github.com/sadnankaabeer/AROWA-Template-Manager/edit/main/index.html" target="_blank" rel="noopener noreferrer">Edit GitHub</a></div></div><button class="secondary" onclick="resetData()">Reset to Default</button><span id="reloadStatus" class="reload-status">Auto reload: waiting</span></div></div><div id="grid" class="grid"><article class="card" draggable="true" data-index="0" title="Hold করে drag করলে template-এর position পরিবর্তন হবে"><div class="card-head"><div><h3>আতর ব্যবহারের নিয়ম (৪ ধাপ)</h3></div><div class="mini-actions"><button class="secondary edit">Edit</button></div></div><pre>আতর ব্যবহারের নিয়মঃ
 
-লংজেভিটি: ৬ ঘণ্টা
+০১. অল্প পরিমাণ ব্যবহার করুন
+আতর কনসেনট্রেটেড হওয়ায় খুব অল্প পরিমাণই যথেষ্ট। কব্জিতে এক ফোঁটা দিয়ে শুরু করুন।
 
-প্রজেকশন: শরীরের তাপের সঙ্গে ধীরে ধীরে সুবাস ছড়ায়। ওয়েবসাইটে আলাদা projection rating নেই।
+০২. পালস পয়েন্টে লাগান
+কব্জি, ঘাড়ের পাশে বা কানের পেছনে লাগালে শরীরের স্বাভাবিক উষ্ণতায় ঘ্রাণ ধীরে ধীরে সুন্দরভাবে ছড়ায়।
 
-তবে স্থায়িত্ব ও ছড়িয়ে পড়া ত্বকের ধরন, ব্যবহার এবং আবহাওয়ার ওপর কিছুটা কম-বেশি হতে পারে।</pre></article><article class="card" draggable="true" data-index="1" title="Hold করে drag করলে template-এর position পরিবর্তন হবে"><div class="card-head"><div><h3>Type ও Region, আতর নির্বাচন</h3><span class="tag">29টি আতর select করা যাবে</span></div><div class="mini-actions"><button class="secondary edit">Edit</button></div></div><select><option value="0">1. Musk Al Tahara</option><option value="1">2. Musk Al Shafaq</option><option value="2">3. Khamrah</option><option value="3">4. Khamrah Qawa</option><option value="4">5. Bianco Latte</option><option value="5">6. Saffron</option><option value="6">7. Ruh Khus</option><option value="7">8. White/Absolute Lotus</option><option value="8">9. Kasturi</option><option value="9">10. Kasturi - Deer Musk</option><option value="10">11. Black Rose</option><option value="11">12. Ruh Gulab (100% Pure)</option><option value="12">13. Ruh Gulab (Synthetic)</option><option value="13">14. Moroccan Rose</option><option value="14">15. Palanpuri Rose</option><option value="15">16. Wardia Crystal Rose</option><option value="16">17. Smoky Oud</option><option value="17">18. Rose de Mai</option><option value="18">19. Oud - Sylheti</option><option value="19">20. Oud - Sylheti (Dehn Al Oud)</option><option value="20">21. Dehn Al Oud Suyufi</option><option value="21">22. Amber Oudh</option><option value="22">23. Mesk e Amber</option><option value="23">24. Mysore Sandal</option><option value="24">25. Baccarat Rouge</option><option value="25">26. Vampire Blood</option><option value="26">27. Musk Fakhir</option><option value="27">28. Jafran Musk</option><option value="28">29. Paris Hilton</option></select><pre>Musk Al Tahara আতরঃ
+০৩. লাগানোর পর ঘষবেন না
+আতর লাগিয়ে দুই কব্জি ঘষবেন না। এতে ঘ্রাণের স্বাভাবিক স্তর নষ্ট হতে পারে। আলতোভাবে ছুঁয়ে দিলেই যথেষ্ট।
 
-ধরন: Synthetic
-কোথা থেকে আনা হয়েছে: তথ্য উল্লেখ নেই</pre></article><article class="card" draggable="true" data-index="2" title="Hold করে drag করলে template-এর position পরিবর্তন হবে"><div class="card-head"><div><h3>Fragrance Notes ও Gender, আতর নির্বাচন</h3><span class="tag">29টি আতর select করা যাবে</span></div><div class="mini-actions"><button class="secondary edit">Edit</button></div></div><select><option value="0">1. Musk Al Tahara</option><option value="1">2. Musk Al Shafaq</option><option value="2">3. Khamrah</option><option value="3">4. Khamrah Qawa</option><option value="4">5. Bianco Latte</option><option value="5">6. Saffron</option><option value="6">7. Ruh Khus</option><option value="7">8. White/Absolute Lotus</option><option value="8">9. Kasturi</option><option value="9">10. Kasturi - Deer Musk</option><option value="10">11. Black Rose</option><option value="11">12. Ruh Gulab (100% Pure)</option><option value="12">13. Ruh Gulab (Synthetic)</option><option value="13">14. Moroccan Rose</option><option value="14">15. Palanpuri Rose</option><option value="15">16. Wardia Crystal Rose</option><option value="16">17. Smoky Oud</option><option value="17">18. Rose de Mai</option><option value="18">19. Oud - Sylheti</option><option value="19">20. Oud - Sylheti (Dehn Al Oud)</option><option value="20">21. Dehn Al Oud Suyufi</option><option value="21">22. Amber Oudh</option><option value="22">23. Mesk e Amber</option><option value="23">24. Mysore Sandal</option><option value="24">25. Baccarat Rouge</option><option value="25">26. Vampire Blood</option><option value="26">27. Musk Fakhir</option><option value="27">28. Jafran Musk</option><option value="28">29. Paris Hilton</option></select><pre>Musk Al Tahara আতরঃ
-
-জেন্ডার: ইউনিসেক্স
-
-ফ্র্যাগরেন্স নোট (যেভাবে ছড়ায়):
-Top: White Flower, Fresh Accords
-Mid: Powdery Musk, Tonka Bean, Rose, Iris
-Base: White Musk, Amber</pre></article><article class="card" draggable="true" data-index="3" title="Hold করে drag করলে template-এর position পরিবর্তন হবে"><div class="card-head"><div><h3>Full Product Details, আতর নির্বাচন</h3><span class="tag">29টি আতর select করা যাবে</span></div><div class="mini-actions"><button class="secondary edit">Edit</button></div></div><select><option value="0">1. Musk Al Tahara</option><option value="1">2. Musk Al Shafaq</option><option value="2">3. Khamrah</option><option value="3">4. Khamrah Qawa</option><option value="4">5. Bianco Latte</option><option value="5">6. Saffron</option><option value="6">7. Ruh Khus</option><option value="7">8. White/Absolute Lotus</option><option value="8">9. Kasturi</option><option value="9">10. Kasturi - Deer Musk</option><option value="10">11. Black Rose</option><option value="11">12. Ruh Gulab (100% Pure)</option><option value="12">13. Ruh Gulab (Synthetic)</option><option value="13">14. Moroccan Rose</option><option value="14">15. Palanpuri Rose</option><option value="15">16. Wardia Crystal Rose</option><option value="16">17. Smoky Oud</option><option value="17">18. Rose de Mai</option><option value="18">19. Oud - Sylheti</option><option value="19">20. Oud - Sylheti (Dehn Al Oud)</option><option value="20">21. Dehn Al Oud Suyufi</option><option value="21">22. Amber Oudh</option><option value="22">23. Mesk e Amber</option><option value="23">24. Mysore Sandal</option><option value="24">25. Baccarat Rouge</option><option value="25">26. Vampire Blood</option><option value="26">27. Musk Fakhir</option><option value="27">28. Jafran Musk</option><option value="28">29. Paris Hilton</option></select><pre>Musk Al Tahara আতরঃ
-
-জেন্ডার: ইউনিসেক্স
-ধরন: Synthetic
-কোথা থেকে আনা হয়েছে: তথ্য উল্লেখ নেই
-লংজেভিটি: ৬ ঘণ্টা
-প্রজেকশন: শরীরের তাপের সঙ্গে ধীরে ধীরে সুবাস ছড়ায়। ওয়েবসাইটে আলাদা projection rating নেই।
-
-ফ্র্যাগরেন্স নোট (যেভাবে ছড়ায়):
-Top · শুরু: White Flower, Fresh Accords
-Mid · মাঝে: Powdery Musk, Tonka Bean, Rose, Iris
-Base · শেষে: White Musk, Amber
-
-আতর ব্যবহারের নিয়মঃ
-০১. কব্জিতে এক ফোঁটাই যথেষ্ট, আতর অনেক স্ট্রং।
-০২. কব্জি, ঘাড়ের পাশে বা কানের পেছনের মতো পালস পয়েন্টে লাগান, শরীরের গরমে ঘ্রাণ ছড়াবে।
-০৩. লাগানোর পর ঘষবেন না, আলতো করে ছুঁয়ে দিন।
-০৪. বোতলটি রোদ ও গরম থেকে দূরে, ঠান্ডা ও অন্ধকার জায়গায় সংরক্ষণ করুন।</pre></article></div><div id="empty" class="empty" style="display:none">কোনো template পাওয়া যায়নি।</div></main>
+০৪. সঠিকভাবে সংরক্ষণ করুন
+বোতলটি সরাসরি রোদ, অতিরিক্ত গরম ও আর্দ্রতা থেকে দূরে ঠান্ডা ও অন্ধকার জায়গায় রাখুন। এতে আতরের মান ও ঘ্রাণ দীর্ঘদিন ভালো থাকবে।</pre></article><article class="card add-card"><div class="add-card-inner"><div class="add-card-plus">+</div><strong>Add New Template</strong><div class="helper">এই category-তে নতুন template যোগ করুন</div></div></article></div><div id="empty" class="empty" style="display:none">কোনো template পাওয়া যায়নি।</div></main>
 <div id="copyToast" class="copy-toast">✓ কপি হয়েছে</div>
 
 <div id="categoryModal" class="modal"><div class="panel"><h2 id="categoryModalTitle">New Category</h2><label>Category name</label><input id="categoryName" type="text"><div class="modal-actions"><button class="secondary" onclick="closeModal('categoryModal')">Cancel</button><button onclick="saveCategory()">Save</button></div></div></div>
-<div id="templateModal" class="modal"><div class="panel"><h2 id="templateModalTitle">Edit Template</h2><label>Category</label><select id="templateCategory"><option value="0">Product &amp; Price 🏷️</option><option value="1">Order &amp; Inbox 📥</option><option value="2">Delivery &amp; Return 🚚</option><option value="3">Bag &amp; Gift 🎁</option><option value="4">3 ml Policy 🧴</option><option value="5">Product Details 📋</option><option value="6">আতর ব্যবহারের নিয়ম 📖</option><option value="7">Follow-up 🔔</option></select><label>Template title</label><input id="templateTitle" type="text"><label>Template body</label><textarea id="templateBody"></textarea><p class="helper">Dynamic reply বানাতে placeholders: {{{attar}}}, {{{priceLines}}}, {{{price3ml}}}, {{{price12}}}, {{{total12}}}, {{{url}}}, {{{longevity}}}, {{{projection}}}, {{{type}}}, {{{region}}}, {{{bagPolicy}}}, {{{gender}}}, {{{topNote}}}, {{{midNote}}}, {{{baseNote}}}, {{{notes}}}, {{{allAttars}}}, {{{allPrices}}}। {{attar}} বা {{priceLines}}-সহ যেকোনো product placeholder থাকলে আতরের selector স্বয়ংক্রিয়ভাবে দেখাবে।</p><div class="modal-actions"><button class="secondary" onclick="closeModal('templateModal')">Cancel</button><button onclick="saveTemplate()">Save</button></div></div></div>
+<div id="templateModal" class="modal"><div class="panel"><h2 id="templateModalTitle">Edit Template</h2><label>Category</label><select id="templateCategory"><option value="0">Product &amp; Price 🏷️</option><option value="1">Order &amp; Inbox 📥</option><option value="2">Delivery &amp; Return 🚚</option><option value="3">Bag &amp; Gift 🎁</option><option value="4">3 ml Policy 🧴</option><option value="5">Product Details 📋</option><option value="6">আতর ব্যবহারের নিয়ম 📖</option><option value="7">Follow-up 🔔</option></select><label>Template title</label><input id="templateTitle" type="text"><label>Template body</label><textarea id="templateBody"></textarea><p class="helper">Dynamic reply বানাতে placeholders: {{{attar}}}, {{{priceLines}}}, {{{price3ml}}}, {{{price12}}}, {{{total12}}}, {{{url}}}, {{{longevity}}}, {{{projection}}}, {{{type}}}, {{{region}}}, {{{bagPolicy}}}, {{{gender}}}, {{{topNote}}}, {{{midNote}}}, {{{baseNote}}}, {{{notes}}}, {{{allAttars}}}, {{{allPrices}}}। {{attar}} বা {{priceLines}}-সহ যেকোনো product placeholder থাকলে আতরের selector স্বয়ংক্রিয়ভাবে দেখাবে।</p><div class="modal-actions"><button class="danger" id="templateModalDelete" style="display: inline-block; margin-right: auto;" onclick="deleteCurrentTemplate()">Delete</button><button class="secondary" onclick="closeModal('templateModal')">Cancel</button><button onclick="saveTemplate()">Save</button></div></div></div>
+<div id="attarManagerModal" class="modal"><div class="panel"><h2>Manage Attars</h2><p class="helper">এখান থেকে আতরের নাম, দাম (৩/৬/১২ মিলি) এবং বিস্তারিত তথ্য যোগ, এডিট বা ডিলিট করতে পারবেন।</p><div class="modal-actions" style="justify-content:flex-start;margin-top:0"><button onclick="openAttarModal(null)">+ Add New Attar</button></div><div id="attarManagerList" style="margin-top:10px"><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Musk Al Tahara</strong><div class="helper">৩ মিলি: ৳৫০০ · ৬ মিলি: ৳৯৪৯ · ১২ মিলি: ৳১,৮৫৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Musk Al Shafaq</strong><div class="helper">৩ মিলি: ৳৬৫০ · ৬ মিলি: ৳১,০৯৯ · ১২ মিলি: ৳২,০৯৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Khamrah</strong><div class="helper">৩ মিলি: ৳৫৬০ · ৬ মিলি: ৳১,০৫৯ · ১২ মিলি: ৳২,০৭৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Khamrah Qawa</strong><div class="helper">৩ মিলি: ৳৫৫০ · ৬ মিলি: ৳১,০৪৯ · ১২ মিলি: ৳২,০৫৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Bianco Latte</strong><div class="helper">৩ মিলি: ৳৪৩০ · ৬ মিলি: ৳৮১৯ · ১২ মিলি: ৳১,৬০৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Saffron</strong><div class="helper">৩ মিলি: ৳৪৩০ · ৬ মিলি: ৳৮১৯ · ১২ মিলি: ৳১,৬০৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Ruh Khus</strong><div class="helper">৩ মিলি: ৳১,০০০ · ৬ মিলি: ৳১,৮৯৯ · ১২ মিলি: ৳৩,৭১৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>White/Absolute Lotus</strong><div class="helper">৩ মিলি: ৳১,৪০০ · ৬ মিলি: ৳২,৬৪৯ · ১২ মিলি: ৳৫,১৯৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Kasturi</strong><div class="helper">৩ মিলি: ৳১,১৯০ · ৬ মিলি: ৳২,২৫৯ · ১২ মিলি: ৳৪,৪১৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Kasturi - Deer Musk</strong><div class="helper">৩ মিলি: ৳১৩,০৯০ · ৬ মিলি: ৳২৪,৮৭১ · ১২ মিলি: ৳৪৮,৬৯৫</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Black Rose</strong><div class="helper">৩ মিলি: ৳১,১৪০ · ৬ মিলি: ৳২,১৫৯ · ১২ মিলি: ৳৪,২৩৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Ruh Gulab (100% Pure)</strong><div class="helper">৩ মিলি: ৳২,১৫০ · ৬ মিলি: ৳৪,০৭৯ · ১২ মিলি: ৳৭,৯৮৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Ruh Gulab (Synthetic)</strong><div class="helper">৩ মিলি: ৳১,০২০ · ৬ মিলি: ৳১,৯৩৯ · ১২ মিলি: ৳৩,৮০৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Moroccan Rose</strong><div class="helper">৩ মিলি: ৳৪,২৮০ · ৬ মিলি: ৳৮,১২৯ · ১২ মিলি: ৳১৫,৯১৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Palanpuri Rose</strong><div class="helper">৩ মিলি: ৳২,১৫০ · ৬ মিলি: ৳৪,০৭৯ · ১২ মিলি: ৳৭,৯৮৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Wardia Crystal Rose</strong><div class="helper">৩ মিলি: ৳২,৫১০ · ৬ মিলি: ৳৪,৭৬৯ · ১২ মিলি: ৳৯,৩২৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Smoky Oud</strong><div class="helper">৩ মিলি: ৳৭১০ · ৬ মিলি: ৳১,৩৪৯ · ১২ মিলি: ৳২,৬৩৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Rose de Mai</strong><div class="helper">৩ মিলি: ৳২,৫১০ · ৬ মিলি: ৳৪,৭৬৯ · ১২ মিলি: ৳৯,৩২৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Oud - Sylheti</strong><div class="helper">মূল্য এখনো নির্ধারিত হয়নি।</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Oud - Sylheti (Dehn Al Oud)</strong><div class="helper">মূল্য এখনো নির্ধারিত হয়নি।</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Dehn Al Oud Suyufi</strong><div class="helper">৩ মিলি: ৳৪,১৩০ · ৬ মিলি: ৳৭,৮৩৯ · ১২ মিলি: ৳১৫,৩৫৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Amber Oudh</strong><div class="helper">৩ মিলি: ৳২,১৫০ · ৬ মিলি: ৳৪,০৭৯ · ১২ মিলি: ৳৭,৯৮৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Mesk e Amber</strong><div class="helper">৩ মিলি: ৳১,১৪০ · ৬ মিলি: ৳২,১৫৯ · ১২ মিলি: ৳৪,২৩৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Mysore Sandal</strong><div class="helper">৩ মিলি: ৳২,৫১০ · ৬ মিলি: ৳৪,৭৬৯ · ১২ মিলি: ৳৯,৩২৯</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Baccarat Rouge</strong><div class="helper">৬ মিলি: ৳৬৫০ · ১২ মিলি: ৳১,১০০</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Vampire Blood</strong><div class="helper">৬ মিলি: ৳৫৫০ · ১২ মিলি: ৳৯০০</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Musk Fakhir</strong><div class="helper">৬ মিলি: ৳১,১০০ · ১২ মিলি: ৳২,০০০</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Jafran Musk</strong><div class="helper">৬ মিলি: ৳১,২০০ · ১২ মিলি: ৳২,০০০</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 10px 0px; border-bottom: 1px solid rgb(238, 238, 238);"><div><strong>Paris Hilton</strong><div class="helper">৬ মিলি: ৳৪৫০ · ১২ মিলি: ৳৭৫০</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div></div><div class="modal-actions"><button class="secondary" onclick="closeModal('attarManagerModal')">Close</button></div></div></div>
+<div id="attarModal" class="modal"><div class="panel"><h2 id="attarModalTitle">Edit Attar</h2><label>আতরের নাম</label><input id="attarName" type="text"><label>দাম (ফাঁকা রাখলে সেই মিলি বিক্রি হবে না)</label><div class="price-grid"><div><label>৩ মিলি (৳)</label><input id="attarPrice3" type="number" min="0"></div><div><label>৬ মিলি (৳)</label><input id="attarPrice6" type="number" min="0"></div><div><label>১২ মিলি (৳)</label><input id="attarPrice12" type="number" min="0"></div></div><label>Website URL</label><input id="attarUrl" type="text"><div class="price-grid"><div><label>Type</label><input id="attarType" type="text" placeholder="100% Pure / Synthetic"></div><div><label>Region</label><input id="attarRegion" type="text"></div><div><label>Gender</label><input id="attarGender" type="text" placeholder="ইউনিসেক্স"></div></div><div class="price-grid"><div><label>Longevity</label><input id="attarLongevity" type="text"></div><div><label>Projection</label><input id="attarProjection" type="text"></div><div><label>Bag Policy</label><input id="attarBagPolicy" type="text"></div></div><label>Top Note</label><input id="attarTop" type="text"><label>Mid Note</label><input id="attarMid" type="text"><label>Base Note</label><input id="attarBase" type="text"><div class="modal-actions"><button class="danger" id="attarModalDelete" style="display: inline-block; margin-right: auto;" onclick="deleteCurrentAttar()">Delete</button><button class="secondary" onclick="closeModal('attarModal')">Cancel</button><button onclick="saveAttar()">Save</button></div></div></div>
 <div id="htmlExportModal" class="modal"><div class="panel"><h2>Updated HTML Code</h2><p class="helper">আপনার বর্তমান category ও template edit-সহ সম্পূর্ণ HTML code নিচে তৈরি হয়েছে। Copy করে নতুন .html file-এ paste করতে পারবেন।</p><textarea id="htmlExportCode" readonly="" style="min-height:420px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px"></textarea><div class="modal-actions"><button class="secondary" onclick="closeModal('htmlExportModal')">Close</button><button onclick="copyExportHtml()">Copy HTML Code</button></div></div></div>
-<div id="managerModal" class="modal"><div class="panel"><h2>Edit Category &amp; Template</h2><div id="managerList"><div style="border-bottom: 1px solid rgb(238, 238, 238); padding: 12px 0px;"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><strong>Product &amp; Price 🏷️</strong><div><button class="secondary">Edit Category</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>নতুন মেসেজ শুরু, স্যার</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>নারী গ্রাহকের ক্ষেত্রে, ম্যাম</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>অর্ডারের তথ্য + Website Link</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>১২ মিলি নিতে চাই</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>অর্ডার Confirm, ১২ মিলি</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Mixed Post, Attar + Bag</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Only Attar Post</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>এটা কি আতর?</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>এটা কি আতর? Inbox Full</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Website / Catalogue</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Price জিজ্ঞেস করলে?</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Anyone available in chat মেসেজ করলে?</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>কথা বুঝিনি</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div></div><div style="border-bottom: 1px solid rgb(238, 238, 238); padding: 12px 0px;"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><strong>Order &amp; Inbox 📥</strong><div><button class="secondary">Edit Category</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>অর্ডারের তথ্য চাই</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Public Comment, Price</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Public Comment, Order</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Order Confirm করব?</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Address চাই</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div></div><div style="border-bottom: 1px solid rgb(238, 238, 238); padding: 12px 0px;"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><strong>Delivery &amp; Return 🚚</strong><div><button class="secondary">Edit Category</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Delivery Charge</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>ঠিকানা অনুযায়ী Delivery Charge</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>সারা বাংলাদেশে Delivery</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Delivery Time</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Testing Bottle Policy</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Return Policy</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Physical Shop নেই</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Packaging Safe</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div></div><div style="border-bottom: 1px solid rgb(238, 238, 238); padding: 12px 0px;"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><strong>Bag &amp; Gift 🎁</strong><div><button class="secondary">Edit Category</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>৬ মিলিতে Bag আছে?</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>১২ মিলির সঙ্গে Bag</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Bag-only Post</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>দুটি আলাদা Bag</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div></div><div style="border-bottom: 1px solid rgb(238, 238, 238); padding: 12px 0px;"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><strong>3 ml Policy 🧴</strong><div><button class="secondary">Edit Category</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>নির্দিষ্ট ৫টি আতরের ৩ মিলি Policy</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>৩ মিলির দাম, আতর নির্বাচন</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div></div><div style="border-bottom: 1px solid rgb(238, 238, 238); padding: 12px 0px;"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><strong>Product Details 📋</strong><div><button class="secondary">Edit Category</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Longevity ও Projection, আতর নির্বাচন</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Type ও Region, আতর নির্বাচন</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Fragrance Notes ও Gender, আতর নির্বাচন</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Full Product Details, আতর নির্বাচন</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div></div><div style="border-bottom: 1px solid rgb(238, 238, 238); padding: 12px 0px;"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><strong>আতর ব্যবহারের নিয়ম 📖</strong><div><button class="secondary">Edit Category</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>আতর ব্যবহারের নিয়ম (৪ ধাপ)</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div></div><div style="border-bottom: 1px solid rgb(238, 238, 238); padding: 12px 0px;"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><strong>Follow-up 🔔</strong><div><button class="secondary">Edit Category</button> <button class="danger">Delete</button></div></div><div style="display: flex; justify-content: space-between; gap: 8px; padding: 8px 0px 0px 14px;"><span>Delivery ও Customer Experience Follow-up</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div></div></div></div><div class="modal-actions"><button onclick="closeModal('managerModal')">Done</button></div></div></div>
+<div id="managerModal" class="modal"><div class="panel"><h2>Edit Category &amp; Template</h2><div id="managerList"></div><div class="modal-actions"><button onclick="closeModal('managerModal')">Done</button></div></div></div>
 <script>
-const attars=[{"name":"Musk Al Tahara","url":"https://arowabd.com/bn/products/musk-al-tahara-a-clean-milky-musk-that-feels-like-peace","longevity":"৬ ঘণ্টা","projection":"শরীরের তাপের সঙ্গে ধীরে ধীরে সুবাস ছড়ায়। ওয়েবসাইটে আলাদা projection rating নেই।","prices":[[3,500],[6,949],[12,1859]],"type":"Synthetic","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।","gender":"ইউনিসেক্স","notes":{"top":"White Flower, Fresh Accords","mid":"Powdery Musk, Tonka Bean, Rose, Iris","base":"White Musk, Amber"}},{"name":"Musk Al Shafaq","url":"https://arowabd.com/bn/products/musk-al-shafaq-warm-spicy-serenity-gently-wrapped-in-honeyed-softness","longevity":"১১ ঘণ্টা","projection":"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।","prices":[[3,650],[6,1099],[12,2099]],"type":"Synthetic","region":"France","bagPolicy":"৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।","gender":"ইউনিসেক্স","notes":{"top":"White Floral, Powdery, Fresh","mid":"Amber, Vanilla, Green","base":"Sweet, Warm Spicy, Balsamic"}},{"name":"Khamrah","url":"https://arowabd.com/bn/products/khamrah-a-luxurious-blend-of-honey-soaked-dates-and-warm-spices","longevity":"৮ ঘণ্টা","projection":"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।","prices":[[3,560],[6,1059],[12,2079]],"type":"Synthetic","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।","gender":"ইউনিসেক্স","notes":{"top":"Bergamot, Cinnamon, Nutmeg","mid":"Dates Accord, Lily Of The Valley, Praline, Tuberose","base":"Roasted Tonka, Benzoin Laos, Myrrh, Akigalawood, Vanilla, Amber Wood"}},{"name":"Khamrah Qawa","url":"https://arowabd.com/bn/products/khamrah-qahwa-an-oriental-fusion-of-honey-dates-and-coffee","longevity":"৮ ঘণ্টা","projection":"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।","prices":[[3,550],[6,1049],[12,2059]],"type":"Synthetic","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।","gender":"ইউনিসেক্স","notes":{"top":"Ginger, Cinnamon, Cardamom","mid":"Praline, Candied Fruits, White Flowers","base":"Coffee Arabica, Tonka Beans, Musk, Benzoin, Vanilla"}},{"name":"Bianco Latte","url":"https://arowabd.com/bn/products/bianco-latte-caramelized-vanilla-white-musk-and-creamy-indulgence","longevity":"৬ ঘণ্টা","projection":"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।","prices":[[3,430],[6,819],[12,1609]],"type":"Synthetic","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।","gender":"ইউনিসেক্স","notes":{"top":"ক্যারামেল","mid":"মধু, কুমারিন","base":"ভ্যানিলা, হোয়াইট মাস্ক"}},{"name":"Saffron","url":"https://arowabd.com/bn/products/red-saffron-jafran","longevity":"১২ ঘণ্টা","projection":"অল্প কয়েক ফোঁটাই পুরো দিনের জন্য নরম সুবাস ছড়িয়ে রাখতে পারে।","prices":[[3,430],[6,819],[12,1609]],"type":"Synthetic","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।","gender":"ইউনিসেক্স","notes":{"top":"তথ্য পাওয়া যায়নি","mid":"তথ্য পাওয়া যায়নি","base":"তথ্য পাওয়া যায়নি"}},{"name":"Ruh Khus","url":"https://arowabd.com/bn/products/ruh-khus-our-most-famous-pure-vetiver-root-oil","longevity":"২৪ ঘণ্টা","projection":"ত্বকে সাধারণত ৮–১০ ঘণ্টা এবং কাপড়ে ২৪ ঘণ্টারও বেশি সময় ঘ্রাণ থাকে। আলাদা projection rating উল্লেখ নেই।","prices":[[3,1000],[6,1899],[12,3719]],"type":"100% Pure","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Fresh Green Vetiver","mid":"Earthy, Herbal Root Notes","base":"Woody, Smoky Undertones"}},{"name":"White/Absolute Lotus","url":"https://arowabd.com/bn/products/white-lotus-absolute-mesmerizing-purity-of-lotus-blossom","longevity":"১২ ঘণ্টা","projection":"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।","prices":[[3,1400],[6,2649],[12,5199]],"type":"100% Pure","region":"India","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Aquatic (White Lotus), Green, Clean Floral","mid":"Soft Lotus Floral, Powdery, Honeyed, Watery-sweet","base":"Earthy, Musky, Indolic, Fruity-floral depth"}},{"name":"Kasturi","url":"https://arowabd.com/bn/products/kasturi-most-famous-and-organic","longevity":"১২ ঘণ্টা","projection":"শুরুতে কড়া ও ভারী, পরে কোমল পাউডারি সুবাসে ধীরে ধীরে চারপাশে ছড়িয়ে পড়ে।","prices":[[3,1190],[6,2259],[12,4419]],"type":"100% Pure","region":"Nepal","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Warm Musk, Slight Sweetness, ambrette seed","mid":"Earthy Accord, Woody Nuances","base":"Sandalwood, Resinous Warmth, Deep Musk"}},{"name":"Kasturi - Deer Musk","url":"https://arowabd.com/bn/products/himalayan-deer-musk-real-deer-musk-exceptionally-rare","longevity":"১৫ ঘণ্টা","projection":"অফিশিয়াল product page থেকে projection-এর আলাদা rating নিশ্চিত করা যায়নি।","prices":[[3,13090],[6,24871],[12,48695]],"type":"100% Pure","region":"Nepal","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Sharp animalic burst","mid":"Earthy, leathery depth","base":"Warm, quiet sweetness"}},{"name":"Black Rose","url":"https://arowabd.com/bn/products/black-rose-fictional-by-name-yet-felt-deeper-than-reality","longevity":"৫-৭ ঘণ্টা","projection":"মাঝারি থেকে ভারী, বিশেষত শুরুর কিছুক্ষণ স্পষ্ট প্রজেকশন থাকে।","prices":[[3,1140],[6,2159],[12,4239]],"type":"100% Pure","region":"Dubai","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Bergamot, Black Pepper","mid":"Black Rose (Floral, Earthy, Resinous)","base":"Sandalwood, Labdanum, Musk, Amber"}},{"name":"Ruh Gulab (100% Pure)","url":"https://arowabd.com/bn/products/ruh-gulab-organic-6-000-roses-produce-1-kg-of-rose-oil-luxurious","longevity":"৮ ঘণ্টা","projection":"ঘ্রাণ দীর্ঘস্থায়ী হলেও কোমল ও হালকা তীব্রতার। আলাদা projection rating উল্লেখ নেই।","prices":[[3,2150],[6,4079],[12,7989]],"type":"100% Pure","region":"India","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Sweet Rich Damask Rose","mid":"Delicate Spicy Green Facets","base":"Honeyed Floral Accords"}},{"name":"Ruh Gulab (Synthetic)","url":"https://arowabd.com/bn/products/ruh-gulab-synthetic-classic-rose-scent-budget-friendly","longevity":"৫ ঘণ্টা","projection":"হালকা তীব্রতার, প্রতিদিনের ব্যবহারের উপযোগী।","prices":[[3,1020],[6,1939],[12,3809]],"type":"Synthetic","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।","gender":"ইউনিসেক্স","notes":{"top":"Fresh rose petal","mid":"Sweet floral rose, geraniol","base":"Velvety musk-rose undertone"}},{"name":"Moroccan Rose","url":"https://arowabd.com/bn/products/moroccan-rose-royal-luxury-touched-by-a-rare-rose","longevity":"৪ ঘণ্টা","projection":"সরাসরি ত্বকে ব্যবহারযোগ্য হলেও সংবেদনশীল ত্বকে ক্যারিয়ার অয়েলের সাথে মেশানো ভালো।","prices":[[3,4280],[6,8129],[12,15919]],"type":"100% Pure","region":"Morocco","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Bergamot, Pepper","mid":"Rose","base":"Patchouli, Tonka Bean, Musk"}},{"name":"Palanpuri Rose","url":"https://arowabd.com/bn/products/palanpuri-rose-a-deep-rosy-warmth","longevity":"৭-৮ ঘণ্টা (ত্বকে), কাপড়ে ১৫+ ঘণ্টা","projection":"শীতল আবহাওয়ায় স্থায়িত্ব আরও দীর্ঘ হতে পারে।","prices":[[3,2150],[6,4079],[12,7989]],"type":"100% Pure","region":"India (Palanpur)","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Sweet Rich Damask Rose","mid":"Delicate Spicy Green Facets","base":"Honeyed Floral Accords"}},{"name":"Wardia Crystal Rose","url":"https://arowabd.com/bn/products/wardia-crystal-rose-a-soft-elegant-crystal-rose","longevity":"৯ ঘণ্টা","projection":"শুরুতে মাঝারি-ভারী সিলেজ, প্রায় ৬ ঘণ্টা পর হালকা হয়ে হোয়াইট মাস্কের সাথে মিশে যায়।","prices":[[3,2510],[6,4769],[12,9329]],"type":"100% Pure","region":"France","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Tea rose, Geranium","mid":"Taif rose, Fresh rose petals","base":"White musk"}},{"name":"Smoky Oud","url":"https://arowabd.com/bn/products/smoky-oud-last-of-the-bakhoor-smoke","longevity":"৭ ঘণ্টা","projection":"শুরুতে বেশ চড়া, আধা ঘণ্টা পর নরম হয়ে ওউদ-ভিত্তিক গভীরতায় নামে।","prices":[[3,710],[6,1349],[12,2639]],"type":"Synthetic","region":"Dubai","bagPolicy":"৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।","gender":"ইউনিসেক্স","notes":{"top":"Black Pepper, Warm Spices, Burnt Wood","mid":"Patchouli, Frankincense, Leather","base":"Oud, Amber, Sweet Resin"}},{"name":"Rose de Mai","url":"https://arowabd.com/bn/products/rose-de-mai-france-s-rare-rose-an-almost-otherworldly-scent","longevity":"৮ ঘণ্টা","projection":"সমৃদ্ধ ও মধুমাখা গোলাপি সুবাস, আলাদা projection rating উল্লেখ নেই।","prices":[[3,2510],[6,4769],[12,9329]],"type":"100% Pure","region":"France","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Rose de May absolute","mid":"Immortel, Geranium Rose","base":"Musk"}},{"name":"Oud - Sylheti","url":"","longevity":"তথ্য পাওয়া যায়নি","projection":"তথ্য পাওয়া যায়নি","prices":[],"type":"100% Pure","region":"TBD","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"তথ্য পাওয়া যায়নি","notes":{"top":"তথ্য পাওয়া যায়নি","mid":"তথ্য পাওয়া যায়নি","base":"তথ্য পাওয়া যায়নি"}},{"name":"Oud - Sylheti (Dehn Al Oud)","url":"","longevity":"তথ্য পাওয়া যায়নি","projection":"তথ্য পাওয়া যায়নি","prices":[],"type":"100% Pure","region":"TBD","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"তথ্য পাওয়া যায়নি","notes":{"top":"তথ্য পাওয়া যায়নি","mid":"তথ্য পাওয়া যায়নি","base":"তথ্য পাওয়া যায়নি"}},{"name":"Dehn Al Oud Suyufi","url":"","longevity":"তথ্য পাওয়া যায়নি","projection":"তথ্য পাওয়া যায়নি","prices":[[3,4130],[6,7839],[12,15359]],"type":"100% Pure","region":"India","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"তথ্য পাওয়া যায়নি","notes":{"top":"তথ্য পাওয়া যায়নি","mid":"তথ্য পাওয়া যায়নি","base":"তথ্য পাওয়া যায়নি"}},{"name":"Amber Oudh","url":"","longevity":"তথ্য পাওয়া যায়নি","projection":"তথ্য পাওয়া যায়নি","prices":[[3,2150],[6,4079],[12,7989]],"type":"100% Pure","region":"Dubai","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"তথ্য পাওয়া যায়নি","notes":{"top":"তথ্য পাওয়া যায়নি","mid":"তথ্য পাওয়া যায়নি","base":"তথ্য পাওয়া যায়নি"}},{"name":"Mesk e Amber","url":"","longevity":"তথ্য পাওয়া যায়নি","projection":"তথ্য পাওয়া যায়নি","prices":[[3,1140],[6,2159],[12,4239]],"type":"100% Pure","region":"N/A","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"তথ্য পাওয়া যায়নি","notes":{"top":"তথ্য পাওয়া যায়নি","mid":"তথ্য পাওয়া যায়নি","base":"তথ্য পাওয়া যায়নি"}},{"name":"Mysore Sandal","url":"","longevity":"তথ্য পাওয়া যায়নি","projection":"তথ্য পাওয়া যায়নি","prices":[[3,2510],[6,4769],[12,9329]],"type":"100% Pure","region":"India (Mysore)","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"তথ্য পাওয়া যায়নি","notes":{"top":"তথ্য পাওয়া যায়নি","mid":"তথ্য পাওয়া যায়নি","base":"তথ্য পাওয়া যায়নি"}},
-{"name":"Baccarat Rouge","url":"https://arowabd.com/bn/products/baccarat-rouge-intoxicatingly-sweet-impossibly-rich","longevity":"৭ ঘণ্টা","projection":"শুরুতে জাফরান ও হালকা সিট্রাসের উজ্জ্বলতা, এরপর মিষ্টি অ্যাম্বারি, নরম ফুলেল ও উডি নোট। আলাদা projection rating উল্লেখ নেই।","prices":[[6,650],[12,1100]],"type":"তথ্য উল্লেখ নেই","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Saffron and Jasmine","mid":"Amberwood, Ambergris and Hedione","base":"Fir Resin, Cedar, Sugar, Ambroxan and Oakmoss"}},
-{"name":"Vampire Blood","url":"https://arowabd.com/bn/products/vampire-blood-deep-intoxicating-blend-of-dark-berries-and-mystery","longevity":"৮ ঘণ্টা","projection":"সারা শরীরে সমানভাবে ছড়িয়ে পড়ে, প্যারাবেন মুক্ত ও ডার্মাটোলজিস্ট টেস্টেড।","prices":[[6,550],[12,900]],"type":"তথ্য উল্লেখ নেই","region":"American","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Red berries","mid":"Night-blooming jasmine","base":"Petrifying plum"}},
-{"name":"Musk Fakhir","url":"https://arowabd.com/bn/products/musk-fakhir-calmness-and-gravity-found-in-silence","longevity":"১০ ঘণ্টা","projection":"অ্যালকোহল-মুক্ত, ২৪ ঘণ্টারও বেশি সময় স্থায়ী সুবাস ছড়ায় বলে ওয়েবসাইটে উল্লেখ আছে।","prices":[[6,1100],[12,2000]],"type":"তথ্য উল্লেখ নেই","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Refreshing citrus & spices","mid":"Exotic florals & warm woods","base":"Sensual musk & amber"}},
-{"name":"Jafran Musk","url":"https://arowabd.com/bn/products/jafran-musk-citrus-freshness-kashmiri-saffron-amber-clean-musk","longevity":"৭ ঘণ্টা","projection":"আর্দ্র আবহাওয়ায় প্রজেকশন কম, শুষ্ক আবহাওয়ায় বেশি স্পষ্ট।","prices":[[6,1200],[12,2000]],"type":"তথ্য উল্লেখ নেই","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Saffron, Damask Rose and Orange Blossom","mid":"Daim and Musk","base":"Suede, Incense, Patchouli and Cypriol"}},
-{"name":"Paris Hilton","url":"https://arowabd.com/bn/products/paris-hilton-a-scent-so-enviable-it-commands-attention","longevity":"৭ ঘণ্টা","projection":"গরম ও আর্দ্র আবহাওয়ায় সবচেয়ে ভালো মানিয়ে যায়, ২-৩ স্প্রে যথেষ্ট।","prices":[[6,450],[12,750]],"type":"তথ্য উল্লেখ নেই","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Melon, Apple and Peach","mid":"Freesia, Mimosa, Jasmine, Lily-of-the-Valley, Lily and Tuberose","base":"Musk, Ylang-Ylang, Sandalwood and Oakmoss"}}];
-const limited3mlAttarNames=["Baccarat Rouge","Vampire Blood","Musk Fakhir","Jafran Musk","Paris Hilton"];
-const limited3mlAttars=attars.filter(a=>limited3mlAttarNames.includes(a.name));
-const defaultData=[{"name":"Product & Price","items":[{"title":"নতুন মেসেজ শুরু, স্যার","body":"স্যার,\n{{priceLines}}\n\nপ্রতিটি অর্ডারের সঙ্গে থাকছে ফ্রি টেস্টিং বোতল। আগে ঘ্রাণ যাচাই করুন, পছন্দ না হলে মূল বোতল সিলবদ্ধ অবস্থায় ফেরত দিলে পলিসি অনুযায়ী রিটার্ন নেওয়া হবে।\n\nআপনি কত মিলি নিতে চাচ্ছেন?"},{"title":"নারী গ্রাহকের ক্ষেত্রে, ম্যাম","body":"ম্যাম,\n{{priceLines}}\n\nপ্রতিটি অর্ডারের সঙ্গে থাকছে ফ্রি টেস্টিং বোতল। আগে ঘ্রাণ যাচাই করুন, পছন্দ না হলে মূল বোতল সিলবদ্ধ অবস্থায় ফেরত দিলে পলিসি অনুযায়ী রিটার্ন নেওয়া হবে।\n\nআপনি কত মিলি নিতে চাচ্ছেন?"},{"title":"অর্ডারের তথ্য + Website Link","body":"অর্ডারটি নিশ্চিত করতে অনুগ্রহ করে নিচের তথ্যগুলো পাঠিয়ে দিন:\n\nনামঃ\nজেলাঃ\nউপজেলা/থানাঃ\nসম্পূর্ণ ঠিকানাঃ\nমোবাইল নম্বরঃ\n\nঅথবা {{attar}} আতরটি সরাসরি website থেকে অর্ডার করতে ভিজিট করুনঃ\n{{url}}"},{"title":"১২ মিলি নিতে চাই","body":"জি স্যার, ইন শা আল্লাহ। ১২ মিলি {{attar}}-এর মূল্য {{price12}}।\n\nঅর্ডারটি নিশ্চিত করতে নিচের তথ্যগুলো পাঠিয়ে দিন:\n\nনামঃ\nজেলাঃ\nউপজেলা/থানাঃ\nসম্পূর্ণ ঠিকানাঃ\nমোবাইল নম্বরঃ"},{"title":"অর্ডার Confirm, ১২ মিলি","body":"জি স্যার, আপনার তথ্যগুলো পেয়েছি। ইন শা আল্লাহ, ১২ মিলি {{attar}} আতরের অর্ডারটি নিশ্চিত করা হয়েছে।\n\nপণ্যের মূল্য: {{price12}}\nডেলিভারি চার্জ: ৳১৩০\nমোট: {{total12}}\n\nপাঠানোর আগে প্যাকেজিংয়ের ছবি আপনাকে পাঠানো হবে, ইন শা আল্লাহ।"},{"title":"Mixed Post, Attar + Bag","body":"আসসালামু আলাইকুম স্যার,\n\n{{attar}} আতরঃ\n\n{{priceLines}}\n\nআমাদের যেকোনো ১২ মিলি আতরের সঙ্গে পোস্টে দেখানো প্রিমিয়াম পাউচ ব্যাগটি হাদিয়া হিসেবে দেওয়া হবে।\n\nআপনি কত মিলি নিতে চাচ্ছেন?"},{"title":"Only Attar Post","body":"আসসালামু আলাইকুম স্যার,\n\n{{attar}} আতরঃ\n\n{{priceLines}}\n\nআপনি কত মিলি নিতে চাচ্ছেন?"},{"title":"এটা কি আতর?","body":"জি স্যার, এটি {{attar}} আতর।"},{"title":"এটা কি আতর? Inbox Full","body":"জি স্যার, এটি {{attar}} আতর।\n\n{{priceLines}}\n\nআপনি কত মিলি নিতে চাচ্ছেন?"},{"title":"Website / Catalogue","body":"জি স্যার, আমাদের সব আতর দেখতে ওয়েবসাইট ভিজিট করুন:\nhttps://arowabd.com/bn\n\nপছন্দের আতরটির নাম জানালে দাম ও বিস্তারিত জানিয়ে দেব।"},{"title":"Price জিজ্ঞেস করলে?","body":"আসসালামু আলাইকুম!\n\nস্যার, আপনি কোন আতরটি নিতে চাচ্ছেন? দয়া করে সেই আতরের ছবি আমাদের সঙ্গে শেয়ার করুন।\n\nধন্যবাদ।"},{"title":"Anyone available in chat মেসেজ করলে?","body":"আসসালামু আলাইকুম!\n\nস্যার, বলুন আতর সংক্রান্ত কোন বিষয়ে আপনাকে সহযোগিতা করতে পারি?"},{"title":"কথা বুঝিনি","body":"দুঃখিত স্যার, আপনার কথাটি বুঝতে পারিনি। একটু বিস্তারিতভাবে বলবেন?"}]},{"name":"Order & Inbox","items":[{"title":"অর্ডারের তথ্য চাই","body":"অর্ডারটি নিশ্চিত করতে অনুগ্রহ করে নিচের তথ্যগুলো পাঠিয়ে দিন:\n\nনামঃ\nজেলাঃ\nউপজেলা/থানাঃ\nসম্পূর্ণ ঠিকানাঃ\nমোবাইল নম্বরঃ"},{"title":"Public Comment, Price","body":"স্যার, আপনার ইনবক্স চেক করুন।"},{"title":"Public Comment, Order","body":"স্যার, ইনবক্স চেক করুন।"},{"title":"Order Confirm করব?","body":"আমরা কি আপনার অর্ডারটি নিশ্চিত করে দেব?"},{"title":"Address চাই","body":"আপনার সম্পূর্ণ ঠিকানাটি জানিয়ে দিন, তাহলে ডেলিভারি চার্জ কত হবে জানিয়ে দিচ্ছি।"}]},{"name":"Delivery & Return","items":[{"title":"Delivery Charge","body":"ডেলিভারি চার্জ ৳১৩০।"},{"title":"ঠিকানা অনুযায়ী Delivery Charge","body":"আপনার সম্পূর্ণ ঠিকানাটি জানিয়ে দিন, তাহলে ডেলিভারি চার্জ কত হবে জানিয়ে দিচ্ছি।"},{"title":"সারা বাংলাদেশে Delivery","body":"জি স্যার, আমরা সারা বাংলাদেশে হোম ডেলিভারি করে থাকি, ইন শা আল্লাহ।"},{"title":"Delivery Time","body":"ঢাকার মধ্যে সাধারণত ১–২ দিন এবং ঢাকার বাইরে ২–৪ দিনের মধ্যে ডেলিভারি হয়ে থাকে, ইন শা আল্লাহ।"},{"title":"Testing Bottle Policy","body":"প্রতিটি অর্ডারের সঙ্গে থাকছে ফ্রি টেস্টিং বোতল। আগে ঘ্রাণ যাচাই করুন, পছন্দ না হলে মূল বোতল সিলবদ্ধ অবস্থায় ফেরত দিলে পলিসি অনুযায়ী রিটার্ন নেওয়া হবে।"},{"title":"Return Policy","body":"পছন্দ না হলে মূল বোতল সিলবদ্ধ অবস্থায় ফেরত দিতে পারবেন। রিটার্নের ক্ষেত্রে শুধু ডেলিভারি চার্জ দিতে হবে। টেস্টিং বোতলগুলো আপনার কাছেই থাকবে এবং সেগুলোর জন্য কোনো টাকা দিতে হবে না।"},{"title":"Physical Shop নেই","body":"আমাদের বর্তমানে কোনো ফিজিক্যাল শপ নেই। আমরা অনলাইনের মাধ্যমে সারা বাংলাদেশে হোম ডেলিভারি করে থাকি।"},{"title":"Packaging Safe","body":"জি স্যার, ইন শা আল্লাহ। বক্সগুলো যেন নষ্ট না হয়, সেভাবেই নিরাপদভাবে প্যাকেজিং করা হবে।"}]},{"name":"Bag & Gift","items":[{"title":"৬ মিলিতে Bag আছে?","body":"জি স্যার, {{attar}} আতরের {{bagPolicy}}"},{"title":"১২ মিলির সঙ্গে Bag","body":"১২ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হবে, ইন শা আল্লাহ।"},{"title":"Bag-only Post","body":"আসসালামু আলাইকুম স্যার,\n\nএই প্রিমিয়াম পাউচ ব্যাগটি আলাদাভাবে বিক্রি করা হয় না। আমাদের যেকোনো ১২ মিলি আতরের সঙ্গে হাদিয়া হিসেবে দেওয়া হবে।\n\nআপনি চাইলে ১২ মিলির যেকোনো আতরের দাম ও বিস্তারিত জানিয়ে দিচ্ছি। কোন আতরটি নিতে চাচ্ছেন?"},{"title":"দুটি আলাদা Bag","body":"জি স্যার, অবশ্যই। আপনার প্রয়োজন হলে আমরা দুটি আলাদা শপিং ব্যাগ দিয়ে দেব, ইন শা আল্লাহ।"}]},{"name":"3 ml Policy","items":[{"title":"নির্দিষ্ট ৫টি আতরের ৩ মিলি Policy","body":"স্যার, {{attar}} আতরটি আলাদাভাবে ৩ মিলিতে দেওয়া হচ্ছে না। তবে আমাদের যেকোনো ৬ বা ১২ মিলি আতরের সঙ্গে এটি ৩ মিলি নিতে পারবেন।\n\nএছাড়া একই অথবা ভিন্ন দুটি আতরের ৩+৩ মিলি মিলিয়েও অর্ডার করতে পারবেন, স্যার।"},{"title":"৩ মিলির দাম, আতর নির্বাচন","body":"জি স্যার, {{attar}} আতর ৩ মিলির মূল্য {{price3ml}}।"}]},{"name":"Product Details","items":[{"title":"Longevity ও Projection, আতর নির্বাচন","body":"{{attar}} আতরঃ\n\nলংজেভিটি: {{longevity}}\n\nপ্রজেকশন: {{projection}}\n\nতবে স্থায়িত্ব ও ছড়িয়ে পড়া ত্বকের ধরন, ব্যবহার এবং আবহাওয়ার ওপর কিছুটা কম-বেশি হতে পারে।"},{"title":"Type ও Region, আতর নির্বাচন","body":"{{attar}} আতরঃ\n\nধরন: {{type}}\nকোথা থেকে আনা হয়েছে: {{region}}"},{"title":"Fragrance Notes ও Gender, আতর নির্বাচন","body":"{{attar}} আতরঃ\n\nজেন্ডার: {{gender}}\n\nফ্র্যাগরেন্স নোট (যেভাবে ছড়ায়):\nTop: {{topNote}}\nMid: {{midNote}}\nBase: {{baseNote}}"},{"title":"Full Product Details, আতর নির্বাচন","body":"{{attar}} আতরঃ\n\nজেন্ডার: {{gender}}\nধরন: {{type}}\nকোথা থেকে আনা হয়েছে: {{region}}\nলংজেভিটি: {{longevity}}\nপ্রজেকশন: {{projection}}\n\nফ্র্যাগরেন্স নোট (যেভাবে ছড়ায়):\nTop · শুরু: {{topNote}}\nMid · মাঝে: {{midNote}}\nBase · শেষে: {{baseNote}}\n\nআতর ব্যবহারের নিয়মঃ\n০১. কব্জিতে এক ফোঁটাই যথেষ্ট, আতর অনেক স্ট্রং।\n০২. কব্জি, ঘাড়ের পাশে বা কানের পেছনের মতো পালস পয়েন্টে লাগান, শরীরের গরমে ঘ্রাণ ছড়াবে।\n০৩. লাগানোর পর ঘষবেন না, আলতো করে ছুঁয়ে দিন।\n০৪. বোতলটি রোদ ও গরম থেকে দূরে, ঠান্ডা ও অন্ধকার জায়গায় সংরক্ষণ করুন।"}]},{"name":"আতর ব্যবহারের নিয়ম","items":[{"title":"আতর ব্যবহারের নিয়ম (৪ ধাপ)","body":"আতর ব্যবহারের নিয়মঃ\n\n০১. অল্প পরিমাণ ব্যবহার করুন\nআতর কনসেনট্রেটেড হওয়ায় খুব অল্প পরিমাণই যথেষ্ট। কব্জিতে এক ফোঁটা দিয়ে শুরু করুন।\n\n০২. পালস পয়েন্টে লাগান\nকব্জি, ঘাড়ের পাশে বা কানের পেছনে লাগালে শরীরের স্বাভাবিক উষ্ণতায় ঘ্রাণ ধীরে ধীরে সুন্দরভাবে ছড়ায়।\n\n০৩. লাগানোর পর ঘষবেন না\nআতর লাগিয়ে দুই কব্জি ঘষবেন না। এতে ঘ্রাণের স্বাভাবিক স্তর নষ্ট হতে পারে। আলতোভাবে ছুঁয়ে দিলেই যথেষ্ট।\n\n০৪. সঠিকভাবে সংরক্ষণ করুন\nবোতলটি সরাসরি রোদ, অতিরিক্ত গরম ও আর্দ্রতা থেকে দূরে ঠান্ডা ও অন্ধকার জায়গায় রাখুন। এতে আতরের মান ও ঘ্রাণ দীর্ঘদিন ভালো থাকবে।"}]},{"name":"Follow-up","items":[{"title":"Delivery ও Customer Experience Follow-up","body":"প্রিয় স্যার,\nআরোয়া (Arowa) থেকে অর্ডার করার জন্য আন্তরিক ধন্যবাদ।\n\nআপনার অর্ডারকৃত পণ্যের সাথে যে টেস্টিং বোতলটি দেখছেন, মূল বক্স খোলার আগে আপনি এটি ব্যবহার করে আতরের সুবাস ও মান যাচাই করে নিতে পারবেন। আতরটি পছন্দ না হলে মূল বক্স না খুলেই পণ্যটি রিটার্ন করতে পারবেন।\n\nআর হ্যাঁ, শুধু এটুকুই নয়... 🎁 আপনার জন্য আমাদের পক্ষ থেকে ছোট একটি হাদিয়া রইলো — বক্স খুললেই পাবেন দুটি বিশেষ জনপ্রিয় একটি \"Life Partner\", এবং অন্যটি অন্যতম জনপ্রিয় সুগন্ধি \"Bianco Latte\"।\n\nট্রাই করে দেখুন, ইনশাআল্লাহ আপনার পছন্দের তালিকায় নতুন সংযোজন হতে পারে এই দুটি সুগন্ধিও।\n\nশুভকামনা রইলো। আরোয়া পরিবার"}]}];
+const defaultAttars=[{"name":"Musk Al Tahara","url":"https://arowabd.com/bn/products/musk-al-tahara-a-clean-milky-musk-that-feels-like-peace","longevity":"৬ ঘণ্টা","projection":"শরীরের তাপের সঙ্গে ধীরে ধীরে সুবাস ছড়ায়। ওয়েবসাইটে আলাদা projection rating নেই।","prices":[[3,500],[6,949],[12,1859]],"type":"Synthetic","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।","gender":"ইউনিসেক্স","notes":{"top":"White Flower, Fresh Accords","mid":"Powdery Musk, Tonka Bean, Rose, Iris","base":"White Musk, Amber"}},{"name":"Musk Al Shafaq","url":"https://arowabd.com/bn/products/musk-al-shafaq-warm-spicy-serenity-gently-wrapped-in-honeyed-softness","longevity":"১১ ঘণ্টা","projection":"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।","prices":[[3,650],[6,1099],[12,2099]],"type":"Synthetic","region":"France","bagPolicy":"৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।","gender":"ইউনিসেক্স","notes":{"top":"White Floral, Powdery, Fresh","mid":"Amber, Vanilla, Green","base":"Sweet, Warm Spicy, Balsamic"}},{"name":"Khamrah","url":"https://arowabd.com/bn/products/khamrah-a-luxurious-blend-of-honey-soaked-dates-and-warm-spices","longevity":"৮ ঘণ্টা","projection":"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।","prices":[[3,560],[6,1059],[12,2079]],"type":"Synthetic","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।","gender":"ইউনিসেক্স","notes":{"top":"Bergamot, Cinnamon, Nutmeg","mid":"Dates Accord, Lily Of The Valley, Praline, Tuberose","base":"Roasted Tonka, Benzoin Laos, Myrrh, Akigalawood, Vanilla, Amber Wood"}},{"name":"Khamrah Qawa","url":"https://arowabd.com/bn/products/khamrah-qahwa-an-oriental-fusion-of-honey-dates-and-coffee","longevity":"৮ ঘণ্টা","projection":"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।","prices":[[3,550],[6,1049],[12,2059]],"type":"Synthetic","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।","gender":"ইউনিসেক্স","notes":{"top":"Ginger, Cinnamon, Cardamom","mid":"Praline, Candied Fruits, White Flowers","base":"Coffee Arabica, Tonka Beans, Musk, Benzoin, Vanilla"}},{"name":"Bianco Latte","url":"https://arowabd.com/bn/products/bianco-latte-caramelized-vanilla-white-musk-and-creamy-indulgence","longevity":"৬ ঘণ্টা","projection":"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।","prices":[[3,430],[6,819],[12,1609]],"type":"Synthetic","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।","gender":"ইউনিসেক্স","notes":{"top":"ক্যারামেল","mid":"মধু, কুমারিন","base":"ভ্যানিলা, হোয়াইট মাস্ক"}},{"name":"Saffron","url":"https://arowabd.com/bn/products/red-saffron-jafran","longevity":"১২ ঘণ্টা","projection":"অল্প কয়েক ফোঁটাই পুরো দিনের জন্য নরম সুবাস ছড়িয়ে রাখতে পারে।","prices":[[3,430],[6,819],[12,1609]],"type":"Synthetic","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।","gender":"ইউনিসেক্স","notes":{"top":"তথ্য পাওয়া যায়নি","mid":"তথ্য পাওয়া যায়নি","base":"তথ্য পাওয়া যায়নি"}},{"name":"Ruh Khus","url":"https://arowabd.com/bn/products/ruh-khus-our-most-famous-pure-vetiver-root-oil","longevity":"২৪ ঘণ্টা","projection":"ত্বকে সাধারণত ৮–১০ ঘণ্টা এবং কাপড়ে ২৪ ঘণ্টারও বেশি সময় ঘ্রাণ থাকে। আলাদা projection rating উল্লেখ নেই।","prices":[[3,1000],[6,1899],[12,3719]],"type":"100% Pure","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Fresh Green Vetiver","mid":"Earthy, Herbal Root Notes","base":"Woody, Smoky Undertones"}},{"name":"White/Absolute Lotus","url":"https://arowabd.com/bn/products/white-lotus-absolute-mesmerizing-purity-of-lotus-blossom","longevity":"১২ ঘণ্টা","projection":"ওয়েবসাইটে আলাদা করে projection-এর নির্দিষ্ট মাত্রা উল্লেখ করা হয়নি।","prices":[[3,1400],[6,2649],[12,5199]],"type":"100% Pure","region":"India","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Aquatic (White Lotus), Green, Clean Floral","mid":"Soft Lotus Floral, Powdery, Honeyed, Watery-sweet","base":"Earthy, Musky, Indolic, Fruity-floral depth"}},{"name":"Kasturi","url":"https://arowabd.com/bn/products/kasturi-most-famous-and-organic","longevity":"১২ ঘণ্টা","projection":"শুরুতে কড়া ও ভারী, পরে কোমল পাউডারি সুবাসে ধীরে ধীরে চারপাশে ছড়িয়ে পড়ে।","prices":[[3,1190],[6,2259],[12,4419]],"type":"100% Pure","region":"Nepal","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Warm Musk, Slight Sweetness, ambrette seed","mid":"Earthy Accord, Woody Nuances","base":"Sandalwood, Resinous Warmth, Deep Musk"}},{"name":"Kasturi - Deer Musk","url":"https://arowabd.com/bn/products/himalayan-deer-musk-real-deer-musk-exceptionally-rare","longevity":"১৫ ঘণ্টা","projection":"অফিশিয়াল product page থেকে projection-এর আলাদা rating নিশ্চিত করা যায়নি।","prices":[[3,13090],[6,24871],[12,48695]],"type":"100% Pure","region":"Nepal","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Sharp animalic burst","mid":"Earthy, leathery depth","base":"Warm, quiet sweetness"}},{"name":"Black Rose","url":"https://arowabd.com/bn/products/black-rose-fictional-by-name-yet-felt-deeper-than-reality","longevity":"৫-৭ ঘণ্টা","projection":"মাঝারি থেকে ভারী, বিশেষত শুরুর কিছুক্ষণ স্পষ্ট প্রজেকশন থাকে।","prices":[[3,1140],[6,2159],[12,4239]],"type":"100% Pure","region":"Dubai","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Bergamot, Black Pepper","mid":"Black Rose (Floral, Earthy, Resinous)","base":"Sandalwood, Labdanum, Musk, Amber"}},{"name":"Ruh Gulab (100% Pure)","url":"https://arowabd.com/bn/products/ruh-gulab-organic-6-000-roses-produce-1-kg-of-rose-oil-luxurious","longevity":"৮ ঘণ্টা","projection":"ঘ্রাণ দীর্ঘস্থায়ী হলেও কোমল ও হালকা তীব্রতার। আলাদা projection rating উল্লেখ নেই।","prices":[[3,2150],[6,4079],[12,7989]],"type":"100% Pure","region":"India","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Sweet Rich Damask Rose","mid":"Delicate Spicy Green Facets","base":"Honeyed Floral Accords"}},{"name":"Ruh Gulab (Synthetic)","url":"https://arowabd.com/bn/products/ruh-gulab-synthetic-classic-rose-scent-budget-friendly","longevity":"৫ ঘণ্টা","projection":"হালকা তীব্রতার, প্রতিদিনের ব্যবহারের উপযোগী।","prices":[[3,1020],[6,1939],[12,3809]],"type":"Synthetic","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।","gender":"ইউনিসেক্স","notes":{"top":"Fresh rose petal","mid":"Sweet floral rose, geraniol","base":"Velvety musk-rose undertone"}},{"name":"Moroccan Rose","url":"https://arowabd.com/bn/products/moroccan-rose-royal-luxury-touched-by-a-rare-rose","longevity":"৪ ঘণ্টা","projection":"সরাসরি ত্বকে ব্যবহারযোগ্য হলেও সংবেদনশীল ত্বকে ক্যারিয়ার অয়েলের সাথে মেশানো ভালো।","prices":[[3,4280],[6,8129],[12,15919]],"type":"100% Pure","region":"Morocco","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Bergamot, Pepper","mid":"Rose","base":"Patchouli, Tonka Bean, Musk"}},{"name":"Palanpuri Rose","url":"https://arowabd.com/bn/products/palanpuri-rose-a-deep-rosy-warmth","longevity":"৭-৮ ঘণ্টা (ত্বকে), কাপড়ে ১৫+ ঘণ্টা","projection":"শীতল আবহাওয়ায় স্থায়িত্ব আরও দীর্ঘ হতে পারে।","prices":[[3,2150],[6,4079],[12,7989]],"type":"100% Pure","region":"India (Palanpur)","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Sweet Rich Damask Rose","mid":"Delicate Spicy Green Facets","base":"Honeyed Floral Accords"}},{"name":"Wardia Crystal Rose","url":"https://arowabd.com/bn/products/wardia-crystal-rose-a-soft-elegant-crystal-rose","longevity":"৯ ঘণ্টা","projection":"শুরুতে মাঝারি-ভারী সিলেজ, প্রায় ৬ ঘণ্টা পর হালকা হয়ে হোয়াইট মাস্কের সাথে মিশে যায়।","prices":[[3,2510],[6,4769],[12,9329]],"type":"100% Pure","region":"France","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Tea rose, Geranium","mid":"Taif rose, Fresh rose petals","base":"White musk"}},{"name":"Smoky Oud","url":"https://arowabd.com/bn/products/smoky-oud-last-of-the-bakhoor-smoke","longevity":"৭ ঘণ্টা","projection":"শুরুতে বেশ চড়া, আধা ঘণ্টা পর নরম হয়ে ওউদ-ভিত্তিক গভীরতায় নামে।","prices":[[3,710],[6,1349],[12,2639]],"type":"Synthetic","region":"Dubai","bagPolicy":"৬ মিলির সঙ্গে পাউচ ব্যাগ দেওয়া হয় না। পাউচ ব্যাগটি শুধু ১২ মিলির সঙ্গে দেওয়া হবে।","gender":"ইউনিসেক্স","notes":{"top":"Black Pepper, Warm Spices, Burnt Wood","mid":"Patchouli, Frankincense, Leather","base":"Oud, Amber, Sweet Resin"}},{"name":"Rose de Mai","url":"https://arowabd.com/bn/products/rose-de-mai-france-s-rare-rose-an-almost-otherworldly-scent","longevity":"৮ ঘণ্টা","projection":"সমৃদ্ধ ও মধুমাখা গোলাপি সুবাস, আলাদা projection rating উল্লেখ নেই।","prices":[[3,2510],[6,4769],[12,9329]],"type":"100% Pure","region":"France","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Rose de May absolute","mid":"Immortel, Geranium Rose","base":"Musk"}},{"name":"Oud - Sylheti","url":"","longevity":"তথ্য পাওয়া যায়নি","projection":"তথ্য পাওয়া যায়নি","prices":[],"type":"100% Pure","region":"TBD","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"তথ্য পাওয়া যায়নি","notes":{"top":"তথ্য পাওয়া যায়নি","mid":"তথ্য পাওয়া যায়নি","base":"তথ্য পাওয়া যায়নি"}},{"name":"Oud - Sylheti (Dehn Al Oud)","url":"","longevity":"তথ্য পাওয়া যায়নি","projection":"তথ্য পাওয়া যায়নি","prices":[],"type":"100% Pure","region":"TBD","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"তথ্য পাওয়া যায়নি","notes":{"top":"তথ্য পাওয়া যায়নি","mid":"তথ্য পাওয়া যায়নি","base":"তথ্য পাওয়া যায়নি"}},{"name":"Dehn Al Oud Suyufi","url":"","longevity":"তথ্য পাওয়া যায়নি","projection":"তথ্য পাওয়া যায়নি","prices":[[3,4130],[6,7839],[12,15359]],"type":"100% Pure","region":"India","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"তথ্য পাওয়া যায়নি","notes":{"top":"তথ্য পাওয়া যায়নি","mid":"তথ্য পাওয়া যায়নি","base":"তথ্য পাওয়া যায়নি"}},{"name":"Amber Oudh","url":"","longevity":"তথ্য পাওয়া যায়নি","projection":"তথ্য পাওয়া যায়নি","prices":[[3,2150],[6,4079],[12,7989]],"type":"100% Pure","region":"Dubai","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"তথ্য পাওয়া যায়নি","notes":{"top":"তথ্য পাওয়া যায়নি","mid":"তথ্য পাওয়া যায়নি","base":"তথ্য পাওয়া যায়নি"}},{"name":"Mesk e Amber","url":"","longevity":"তথ্য পাওয়া যায়নি","projection":"তথ্য পাওয়া যায়নি","prices":[[3,1140],[6,2159],[12,4239]],"type":"100% Pure","region":"N/A","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"তথ্য পাওয়া যায়নি","notes":{"top":"তথ্য পাওয়া যায়নি","mid":"তথ্য পাওয়া যায়নি","base":"তথ্য পাওয়া যায়নি"}},{"name":"Mysore Sandal","url":"","longevity":"তথ্য পাওয়া যায়নি","projection":"তথ্য পাওয়া যায়নি","prices":[[3,2510],[6,4769],[12,9329]],"type":"100% Pure","region":"India (Mysore)","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"তথ্য পাওয়া যায়নি","notes":{"top":"তথ্য পাওয়া যায়নি","mid":"তথ্য পাওয়া যায়নি","base":"তথ্য পাওয়া যায়নি"}},{"name":"Baccarat Rouge","url":"https://arowabd.com/bn/products/baccarat-rouge-intoxicatingly-sweet-impossibly-rich","longevity":"৭ ঘণ্টা","projection":"শুরুতে জাফরান ও হালকা সিট্রাসের উজ্জ্বলতা, এরপর মিষ্টি অ্যাম্বারি, নরম ফুলেল ও উডি নোট। আলাদা projection rating উল্লেখ নেই।","prices":[[6,650],[12,1100]],"type":"তথ্য উল্লেখ নেই","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Saffron and Jasmine","mid":"Amberwood, Ambergris and Hedione","base":"Fir Resin, Cedar, Sugar, Ambroxan and Oakmoss"}},{"name":"Vampire Blood","url":"https://arowabd.com/bn/products/vampire-blood-deep-intoxicating-blend-of-dark-berries-and-mystery","longevity":"৮ ঘণ্টা","projection":"সারা শরীরে সমানভাবে ছড়িয়ে পড়ে, প্যারাবেন মুক্ত ও ডার্মাটোলজিস্ট টেস্টেড।","prices":[[6,550],[12,900]],"type":"তথ্য উল্লেখ নেই","region":"American","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Red berries","mid":"Night-blooming jasmine","base":"Petrifying plum"}},{"name":"Musk Fakhir","url":"https://arowabd.com/bn/products/musk-fakhir-calmness-and-gravity-found-in-silence","longevity":"১০ ঘণ্টা","projection":"অ্যালকোহল-মুক্ত, ২৪ ঘণ্টারও বেশি সময় স্থায়ী সুবাস ছড়ায় বলে ওয়েবসাইটে উল্লেখ আছে।","prices":[[6,1100],[12,2000]],"type":"তথ্য উল্লেখ নেই","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Refreshing citrus & spices","mid":"Exotic florals & warm woods","base":"Sensual musk & amber"}},{"name":"Jafran Musk","url":"https://arowabd.com/bn/products/jafran-musk-citrus-freshness-kashmiri-saffron-amber-clean-musk","longevity":"৭ ঘণ্টা","projection":"আর্দ্র আবহাওয়ায় প্রজেকশন কম, শুষ্ক আবহাওয়ায় বেশি স্পষ্ট।","prices":[[6,1200],[12,2000]],"type":"তথ্য উল্লেখ নেই","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Saffron, Damask Rose and Orange Blossom","mid":"Daim and Musk","base":"Suede, Incense, Patchouli and Cypriol"}},{"name":"Paris Hilton","url":"https://arowabd.com/bn/products/paris-hilton-a-scent-so-enviable-it-commands-attention","longevity":"৭ ঘণ্টা","projection":"গরম ও আর্দ্র আবহাওয়ায় সবচেয়ে ভালো মানিয়ে যায়, ২-৩ স্প্রে যথেষ্ট।","prices":[[6,450],[12,750]],"type":"তথ্য উল্লেখ নেই","region":"তথ্য উল্লেখ নেই","bagPolicy":"৬ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হয়।","gender":"ইউনিসেক্স","notes":{"top":"Melon, Apple and Peach","mid":"Freesia, Mimosa, Jasmine, Lily-of-the-Valley, Lily and Tuberose","base":"Musk, Ylang-Ylang, Sandalwood and Oakmoss"}}];
+let limited3mlAttarNames=["Baccarat Rouge","Vampire Blood","Musk Fakhir","Jafran Musk","Paris Hilton"];
+function getLimited3mlAttars(){return attars.filter(a=>limited3mlAttarNames.includes(a.name))}
+const defaultData=[{"name":"Product & Price","items":[{"title":"নতুন মেসেজ শুরু, স্যার","body":"স্যার,\n{{priceLines}}\n\nপ্রতিটি অর্ডারের সঙ্গে থাকছে ফ্রি টেস্টিং বোতল। আগে ঘ্রাণ যাচাই করুন, পছন্দ না হলে মূল বোতল সিলবদ্ধ অবস্থায় ফেরত দিলে পলিসি অনুযায়ী রিটার্ন নেওয়া হবে।\n\nআপনি কত মিলি নিতে চাচ্ছেন?"},{"title":"নারী গ্রাহকের ক্ষেত্রে, ম্যাম","body":"ম্যাম,\n{{priceLines}}\n\nপ্রতিটি অর্ডারের সঙ্গে থাকছে ফ্রি টেস্টিং বোতল। আগে ঘ্রাণ যাচাই করুন, পছন্দ না হলে মূল বোতল সিলবদ্ধ অবস্থায় ফেরত দিলে পলিসি অনুযায়ী রিটার্ন নেওয়া হবে।\n\nআপনি কত মিলি নিতে চাচ্ছেন?"},{"title":"অর্ডারের তথ্য + Website Link","body":"অর্ডারটি নিশ্চিত করতে অনুগ্রহ করে নিচের তথ্যগুলো পাঠিয়ে দিন:\n\nনামঃ\nজেলাঃ\nউপজেলা/থানাঃ\nসম্পূর্ণ ঠিকানাঃ\nমোবাইল নম্বরঃ\n\nঅথবা {{attar}} আতরটি সরাসরি website থেকে অর্ডার করতে ভিজিট করুনঃ\n{{url}}"},{"title":"১২ মিলি নিতে চাই","body":"জি স্যার, ইন শা আল্লাহ। ১২ মিলি {{attar}}-এর মূল্য {{price12}}।\n\nঅর্ডারটি নিশ্চিত করতে নিচের তথ্যগুলো পাঠিয়ে দিন:\n\nনামঃ\nজেলাঃ\nউপজেলা/থানাঃ\nসম্পূর্ণ ঠিকানাঃ\nমোবাইল নম্বরঃ"},{"title":"অর্ডার Confirm, ১২ মিলি","body":"জি স্যার, আপনার তথ্যগুলো পেয়েছি। ইন শা আল্লাহ, ১২ মিলি {{attar}} আতরের অর্ডারটি নিশ্চিত করা হয়েছে।\n\nপণ্যের মূল্য: {{price12}}\nডেলিভারি চার্জ: ৳১৩০\nমোট: {{total12}}\n\nপাঠানোর আগে প্যাকেজিংয়ের ছবি আপনাকে পাঠানো হবে, ইন শা আল্লাহ।"},{"title":"Mixed Post, Attar + Bag","body":"আসসালামু আলাইকুম স্যার,\n\n{{attar}} আতরঃ\n\n{{priceLines}}\n\nআমাদের যেকোনো ১২ মিলি আতরের সঙ্গে পোস্টে দেখানো প্রিমিয়াম পাউচ ব্যাগটি হাদিয়া হিসেবে দেওয়া হবে।\n\nআপনি কত মিলি নিতে চাচ্ছেন?"},{"title":"Only Attar Post","body":"আসসালামু আলাইকুম স্যার,\n\n{{attar}} আতরঃ\n\n{{priceLines}}\n\nআপনি কত মিলি নিতে চাচ্ছেন?"},{"title":"এটা কি আতর?","body":"জি স্যার, এটি {{attar}} আতর।"},{"title":"এটা কি আতর? Inbox Full","body":"জি স্যার, এটি {{attar}} আতর।\n\n{{priceLines}}\n\nআপনি কত মিলি নিতে চাচ্ছেন?"},{"title":"Website / Catalogue","body":"জি স্যার, আমাদের সব আতর দেখতে ওয়েবসাইট ভিজিট করুন:\nhttps://arowabd.com/bn\n\nপছন্দের আতরটির নাম জানালে দাম ও বিস্তারিত জানিয়ে দেব।"},{"title":"Price জিজ্ঞেস করলে?","body":"আসসালামু আলাইকুম!\n\nস্যার, আপনি কোন আতরটি নিতে চাচ্ছেন? দয়া করে সেই আতরের ছবি আমাদের সঙ্গে শেয়ার করুন।\n\nধন্যবাদ।"},{"title":"Anyone available in chat মেসেজ করলে?","body":"আসসালামু আলাইকুম!\n\nস্যার, বলুন আতর সংক্রান্ত কোন বিষয়ে আপনাকে সহযোগিতা করতে পারি?"},{"title":"কথা বুঝিনি","body":"দুঃখিত স্যার, আপনার কথাটি বুঝতে পারিনি। একটু বিস্তারিতভাবে বলবেন?"}]},{"name":"Order & Inbox","items":[{"title":"অর্ডারের তথ্য চাই","body":"অর্ডারটি নিশ্চিত করতে অনুগ্রহ করে নিচের তথ্যগুলো পাঠিয়ে দিন:\n\nনামঃ\nজেলাঃ\nউপজেলা/থানাঃ\nসম্পূর্ণ ঠিকানাঃ\nমোবাইল নম্বরঃ"},{"title":"Public Comment, Price","body":"স্যার, আপনার ইনবক্স চেক করুন।"},{"title":"Public Comment, Order","body":"স্যার, ইনবক্স চেক করুন।"},{"title":"Order Confirm করব?","body":"আমরা কি আপনার অর্ডারটি নিশ্চিত করে দেব?"},{"title":"Address চাই","body":"আপনার সম্পূর্ণ ঠিকানাটি জানিয়ে দিন, তাহলে ডেলিভারি চার্জ কত হবে জানিয়ে দিচ্ছি।"}]},{"name":"Delivery & Return","items":[{"title":"Delivery Charge","body":"ডেলিভারি চার্জ ৳১৩০।"},{"title":"ঠিকানা অনুযায়ী Delivery Charge","body":"আপনার সম্পূর্ণ ঠিকানাটি জানিয়ে দিন, তাহলে ডেলিভারি চার্জ কত হবে জানিয়ে দিচ্ছি।"},{"title":"সারা বাংলাদেশে Delivery","body":"জি স্যার, আমরা সারা বাংলাদেশে হোম ডেলিভারি করে থাকি, ইন শা আল্লাহ।"},{"title":"Delivery Time","body":"ঢাকার মধ্যে সাধারণত ১–২ দিন এবং ঢাকার বাইরে ২–৪ দিনের মধ্যে ডেলিভারি হয়ে থাকে, ইন শা আল্লাহ।"},{"title":"Testing Bottle Policy","body":"প্রতিটি অর্ডারের সঙ্গে থাকছে ফ্রি টেস্টিং বোতল। আগে ঘ্রাণ যাচাই করুন, পছন্দ না হলে মূল বোতল সিলবদ্ধ অবস্থায় ফেরত দিলে পলিসি অনুযায়ী রিটার্ন নেওয়া হবে।"},{"title":"Return Policy","body":"পছন্দ না হলে মূল বোতল সিলবদ্ধ অবস্থায় ফেরত দিতে পারবেন। রিটার্নের ক্ষেত্রে শুধু ডেলিভারি চার্জ দিতে হবে। টেস্টিং বোতলগুলো আপনার কাছেই থাকবে এবং সেগুলোর জন্য কোনো টাকা দিতে হবে না।"},{"title":"Physical Shop নেই","body":"আমাদের বর্তমানে কোনো ফিজিক্যাল শপ নেই। আমরা অনলাইনের মাধ্যমে সারা বাংলাদেশে হোম ডেলিভারি করে থাকি।"},{"title":"Packaging Safe","body":"জি স্যার, ইন শা আল্লাহ। বক্সগুলো যেন নষ্ট না হয়, সেভাবেই নিরাপদভাবে প্যাকেজিং করা হবে।"}]},{"name":"Bag & Gift","items":[{"title":"৬ মিলিতে Bag আছে?","body":"জি স্যার, {{attar}} আতরের {{bagPolicy}}"},{"title":"১২ মিলির সঙ্গে Bag","body":"১২ মিলির সঙ্গে প্রিমিয়াম পাউচ ব্যাগ দেওয়া হবে, ইন শা আল্লাহ।"},{"title":"Bag-only Post","body":"আসসালামু আলাইকুম স্যার,\n\nএই প্রিমিয়াম পাউচ ব্যাগটি আলাদাভাবে বিক্রি করা হয় না। আমাদের যেকোনো ১২ মিলি আতরের সঙ্গে হাদিয়া হিসেবে দেওয়া হবে।\n\nআপনি চাইলে ১২ মিলির যেকোনো আতরের দাম ও বিস্তারিত জানিয়ে দিচ্ছি। কোন আতরটি নিতে চাচ্ছেন?"},{"title":"দুটি আলাদা Bag","body":"জি স্যার, অবশ্যই। আপনার প্রয়োজন হলে আমরা দুটি আলাদা শপিং ব্যাগ দিয়ে দেব, ইন শা আল্লাহ।"}]},{"name":"3 ml Policy","items":[{"title":"নির্দিষ্ট ৫টি আতরের ৩ মিলি Policy","body":"স্যার, {{attar}} আতরটি আলাদাভাবে ৩ মিলিতে দেওয়া হচ্ছে না। তবে আমাদের যেকোনো ৬ বা ১২ মিলি আতরের সঙ্গে এটি ৩ মিলি নিতে পারবেন।\n\nএছাড়া একই অথবা ভিন্ন দুটি আতরের ৩+৩ মিলি মিলিয়েও অর্ডার করতে পারবেন, স্যার।"},{"title":"৩ মিলির দাম, আতর নির্বাচন","body":"জি স্যার, {{attar}} আতর ৩ মিলির মূল্য {{price3ml}}।"}]},{"name":"Product Details","items":[{"title":"Longevity ও Projection, আতর নির্বাচন","body":"{{attar}} আতরঃ\n\nলংজেভিটি: {{longevity}}\n\nপ্রজেকশন: {{projection}}\n\nতবে স্থায়িত্ব ও ছড়িয়ে পড়া ত্বকের ধরন, ব্যবহার এবং আবহাওয়ার ওপর কিছুটা কম-বেশি হতে পারে।"},{"title":"Type ও Region, আতর নির্বাচন","body":"{{attar}} আতরঃ\n\nধরন: {{type}}\nকোথা থেকে আনা হয়েছে: {{region}}"},{"title":"Fragrance Notes ও Gender, আতর নির্বাচন","body":"{{attar}} আতরঃ\n\nজেন্ডার: {{gender}}\n\nফ্র্যাগরেন্স নোট (যেভাবে ছড়ায়):\nTop: {{topNote}}\nMid: {{midNote}}\nBase: {{baseNote}}"},{"title":"Full Product Details, আতর নির্বাচন","body":"{{attar}} আতরঃ\n\nজেন্ডার: {{gender}}\nধরন: {{type}}\nকোথা থেকে আনা হয়েছে: {{region}}\nলংজেভিটি: {{longevity}}\nপ্রজেকশন: {{projection}}\n\nফ্র্যাগরেন্স নোট (যেভাবে ছড়ায়):\nTop · শুরু: {{topNote}}\nMid · মাঝে: {{midNote}}\nBase · শেষে: {{baseNote}}\n\nআতর ব্যবহারের নিয়মঃ\n০১. কব্জিতে এক ফোঁটাই যথেষ্ট, আতর অনেক স্ট্রং।\n০২. কব্জি, ঘাড়ের পাশে বা কানের পেছনের মতো পালস পয়েন্টে লাগান, শরীরের গরমে ঘ্রাণ ছড়াবে।\n০৩. লাগানোর পর ঘষবেন না, আলতো করে ছুঁয়ে দিন।\n০৪. বোতলটি রোদ ও গরম থেকে দূরে, ঠান্ডা ও অন্ধকার জায়গায় সংরক্ষণ করুন।"}]},{"name":"আতর ব্যবহারের নিয়ম","items":[{"title":"আতর ব্যবহারের নিয়ম (৪ ধাপ)","body":"আতর ব্যবহারের নিয়মঃ\n\n০১. অল্প পরিমাণ ব্যবহার করুন\nআতর কনসেনট্রেটেড হওয়ায় খুব অল্প পরিমাণই যথেষ্ট। কব্জিতে এক ফোঁটা দিয়ে শুরু করুন।\n\n০২. পালস পয়েন্টে লাগান\nকব্জি, ঘাড়ের পাশে বা কানের পেছনে লাগালে শরীরের স্বাভাবিক উষ্ণতায় ঘ্রাণ ধীরে ধীরে সুন্দরভাবে ছড়ায়।\n\n০৩. লাগানোর পর ঘষবেন না\nআতর লাগিয়ে দুই কব্জি ঘষবেন না। এতে ঘ্রাণের স্বাভাবিক স্তর নষ্ট হতে পারে। আলতোভাবে ছুঁয়ে দিলেই যথেষ্ট।\n\n০৪. সঠিকভাবে সংরক্ষণ করুন\nবোতলটি সরাসরি রোদ, অতিরিক্ত গরম ও আর্দ্রতা থেকে দূরে ঠান্ডা ও অন্ধকার জায়গায় রাখুন। এতে আতরের মান ও ঘ্রাণ দীর্ঘদিন ভালো থাকবে।"}]},{"name":"Follow-up","items":[{"title":"Delivery ও Customer Experience Follow-up","body":"প্রিয় স্যার,\nআরোয়া (Arowa) থেকে অর্ডার করার জন্য আন্তরিক ধন্যবাদ।\n\nআপনার অর্ডারকৃত পণ্যের সাথে যে টেস্টিং বোতলটি দেখছেন, মূল বক্স খোলার আগে আপনি এটি ব্যবহার করে আতরের সুবাস ও মান যাচাই করে নিতে পারবেন। আতরটি পছন্দ না হলে মূল বক্স না খুলেই পণ্যটি রিটার্ন করতে পারবেন।\n\nআর হ্যাঁ, শুধু এটুকুই নয়... 🎁 আপনার জন্য আমাদের পক্ষ থেকে ছোট একটি হাদিয়া রইলো — বক্স খুললেই পাবেন দুটি বিশেষ জনপ্রিয় একটি \"Life Partner\", এবং অন্যটি অন্যতম জনপ্রিয় সুগন্ধি \"Bianco Latte\"।\n\nট্রাই করে দেখুন, ইনশাআল্লাহ আপনার পছন্দের তালিকায় নতুন সংযোজন হতে পারে এই দুটি সুগন্ধিও।\n\nশুভকামনা রইলো। আরোয়া পরিবার"}]}];
 function normalizePlaceholders(text){
   return String(text||'').replace(/(?<!\{)\{(attar|priceLines|price3ml|price12|total12|url|longevity|projection|type|region|bagPolicy|gender|topNote|midNote|baseNote|notes|allAttars|allPrices)\}(?!\})/g,'{{$1}}');
 }
@@ -113,7 +449,7 @@ function migrateData(source){
       {title:'Website / Catalogue',body:`জি স্যার, আমাদের সব আতর দেখতে ওয়েবসাইট ভিজিট করুন:
 https://arowabd.com/bn
 
-পছন্দের আতরটির নাম জানালে দাম ও বিস্তারিত জানিয়ে দেব।`}
+পছন্দের আতরটির নাম জানালে দাম ও বিস্তারিত জানিয়ে দেব।`}
     ];
     productCat.items=productCat.items.filter(it=>it.title!=='সব আতর দেখতে চাই'&&it.title!=='সব আতরের দাম');
     required.forEach(t=>{if(!productCat.items.some(x=>x.title===t.title))productCat.items.push(t)});
@@ -222,7 +558,8 @@ Base · শেষে: {{baseNote}}
   });
   return migrated;
 }
-const STORAGE_KEY='arowaTemplateDataV10_1785486456821';
+const STORAGE_KEY='arowaTemplateDataV10_1785590855261';
+const ATTAR_STORAGE_KEY='arowaAttarDataV1_1785590855262';
 const savedCurrent=localStorage.getItem(STORAGE_KEY);
 const savedLegacy=null;
 let data;
@@ -236,9 +573,17 @@ if(savedCurrent){
   // template or add a moved template back into its old category.
   data=structuredClone(defaultData);
 }
-let active=0;let editingCategory=null;let editingTemplate=null;let dragState=null;let suppressCopyUntil=0;
-save();
+let attars;
+const savedAttars=localStorage.getItem(ATTAR_STORAGE_KEY);
+if(savedAttars){
+  attars=JSON.parse(savedAttars);
+}else{
+  attars=structuredClone(defaultAttars);
+}
+let active=0;let editingCategory=null;let editingTemplate=null;let editingAttar=null;let dragState=null;let suppressCopyUntil=0;
+save();saveAttars();
 function save(){localStorage.setItem(STORAGE_KEY,JSON.stringify(data))}
+function saveAttars(){localStorage.setItem(ATTAR_STORAGE_KEY,JSON.stringify(attars))}
 function money(n){return n==null?'মূল্য পাওয়া যায়নি':'৳'+new Intl.NumberFormat('bn-BD').format(n)}
 function getPrice(a,ml){const x=a.prices.find(p=>p[0]===ml);return x?x[1]:null}
 function priceLines(a){return a.prices.length?a.prices.map(([ml,p])=>`${new Intl.NumberFormat('bn-BD').format(ml)} মিলি: ${money(p)}`).join('\n'):'মূল্য এখনো নির্ধারিত হয়নি।'}
@@ -246,7 +591,7 @@ function allAttarsText(){return attars.map((a,i)=>`${new Intl.NumberFormat('bn-B
 function allPricesText(){return attars.map((a,i)=>`${new Intl.NumberFormat('bn-BD').format(i+1)}. ${a.name}\n${priceLines(a)}`).join('\n\n')}
 function fillGlobal(body){const map={allAttars:allAttarsText(),allPrices:allPricesText()};return body.replace(/{{(allAttars|allPrices)}}/g,(_,k)=>map[k])}
 function isDynamic(body){return /{{(attar|priceLines|price3ml|price12|total12|url|longevity|projection|type|region|bagPolicy|gender|topNote|midNote|baseNote|notes)}}/.test(body)}
-function selectableAttars(item){return item.title==='নির্দিষ্ট ৫টি আতরের ৩ মিলি Policy'?limited3mlAttars:attars}
+function selectableAttars(item){return item.title==='নির্দিষ্ট ৫টি আতরের ৩ মিলি Policy'?getLimited3mlAttars():attars}
 function fill(body,a){const p3=getPrice(a,3),p12=getPrice(a,12);const notesText=`Top: ${a.notes.top}\nMid: ${a.notes.mid}\nBase: ${a.notes.base}`;const map={attar:a.name,priceLines:priceLines(a),price3ml:money(p3),price12:money(p12),total12:p12==null?'মূল্য পাওয়া যায়নি':money(p12+130),url:a.url||'Website link পাওয়া যায়নি',longevity:a.longevity,projection:a.projection,type:a.type,region:a.region,bagPolicy:a.bagPolicy,gender:a.gender,topNote:a.notes.top,midNote:a.notes.mid,baseNote:a.notes.base,notes:notesText};return fillGlobal(body.replace(/{{(attar|priceLines|price3ml|price12|total12|url|longevity|projection|type|region|bagPolicy|gender|topNote|midNote|baseNote|notes)}}/g,(_,k)=>map[k]))}
 const categoryIcons={
 "Product & Price":"🏷️","Order & Inbox":"📥","Delivery & Return":"🚚","Bag & Gift":"🎁","3 ml Policy":"🧴","Product Details":"📋","Follow-up":"🔔","আতর ব্যবহারের নিয়ম":"📖"
@@ -255,12 +600,12 @@ function categoryLabel(name){return `${name} ${categoryIcons[name]||"📁"}`}
 async function copyText(text,card){try{await navigator.clipboard.writeText(text)}catch(e){const t=document.createElement('textarea');t.value=text;document.body.appendChild(t);t.select();document.execCommand('copy');t.remove()}if(card){card.classList.add('copy-flash');setTimeout(()=>card.classList.remove('copy-flash'),260)}const toast=document.getElementById('copyToast');toast.classList.add('show');clearTimeout(window.copyToastTimer);window.copyToastTimer=setTimeout(()=>toast.classList.remove('show'),1100)}
 function smellStrength(a){
   const text=[a.name,a.projection,a.notes.top,a.notes.mid,a.notes.base].join(' ').toLowerCase();
-  const strong=['strong','heavy','deep','smoky','oud','animalic','leather','warm spicy','resin','intense','ঘাড়ো','কড়া','ভারী','চড়া'];
+  const strong=['strong','heavy','deep','smoky','oud','animalic','leather','warm spicy','resin','intense','ঘাড়ো','কড়া','ভারী','চড়া'];
   const light=['soft','fresh','clean','powdery','aquatic','green','watery','delicate','light','হালকা','কোমল','ফ্রেশ','পরিষ্কার'];
   let s=0,l=0;strong.forEach(w=>{if(text.includes(w))s++});light.forEach(w=>{if(text.includes(w))l++});
   return s>l?'strong':l>s?'light':'medium';
 }
-function smellLabel(level){return level==='strong'?'ঘাড়ো':level==='light'?'হালকা':'মাঝারি'}
+function smellLabel(level){return level==='strong'?'ঘাড়ো':level==='light'?'হালকা':'মাঝারি'}
 function attarSearchText(a){return [a.name,a.type,a.region,a.gender,a.longevity,a.projection,a.notes.top,a.notes.mid,a.notes.base,smellLabel(smellStrength(a)),priceLines(a)].join(' ').toLocaleLowerCase('bn-BD')}
 function getSearchFilterState(){
   return {
@@ -316,16 +661,16 @@ function render(){
  }
 
  if(showAttarResults&&attarResults.length){
-   const title=document.createElement('div');title.className='result-section-title';title.textContent=`আতর পাওয়া গেছে: ${attarResults.length}টি`;grid.appendChild(title);
+   const title=document.createElement('div');title.className='result-section-title';title.textContent=`আতর পাওয়া গেছে: ${attarResults.length}টি`;grid.appendChild(title);
    attarResults.forEach(a=>{
      const f=getSearchFilterState();const selectedPrice=f.ml?getPrice(a,f.ml):null;
      const priceText=f.ml?`${new Intl.NumberFormat('bn-BD').format(f.ml)} মিলি: ${money(selectedPrice)}`:priceLines(a).replace(/\n/g,' · ');
      const card=document.createElement('article');card.className='attar-result';
-     card.innerHTML=`<h3>${a.name}<span class="smell-badge">${smellLabel(smellStrength(a))}</span></h3><div class="attar-meta">${a.type} · ${a.gender} · স্থায়িত্ব ${a.longevity}<br>শুরু: ${a.notes.top}<br>মাঝে: ${a.notes.mid}<br>শেষে: ${a.notes.base}</div><div class="attar-price">${priceText}</div>`;
+     card.innerHTML=`<h3>${a.name}<span class="smell-badge">${smellLabel(smellStrength(a))}</span></h3><div class="attar-meta">${a.type} · ${a.gender} · স্থায়িত্ব ${a.longevity}<br>শুরু: ${a.notes.top}<br>মাঝে: ${a.notes.mid}<br>শেষে: ${a.notes.base}</div><div class="attar-price">${priceText}</div>`;
      card.onclick=()=>copyText(`${a.name} আতরঃ\n\n${priceLines(a)}\n\nঘ্রাণের ধরন: ${smellLabel(smellStrength(a))}\nলংজেভিটি: ${a.longevity}\nTop: ${a.notes.top}\nMid: ${a.notes.mid}\nBase: ${a.notes.base}`,card);
      grid.appendChild(card);
    });
-   if(entries.length){const t=document.createElement('div');t.className='result-section-title';t.textContent=`Template পাওয়া গেছে: ${entries.length}টি`;grid.appendChild(t)}
+   if(entries.length){const t=document.createElement('div');t.className='result-section-title';t.textContent=`Template পাওয়া গেছে: ${entries.length}টি`;grid.appendChild(t)}
  }
  entries.forEach(({cat,ci,item,ii})=>{
    const card=document.createElement('article');card.className='card';card.draggable=!q;card.dataset.index=ii;
@@ -355,16 +700,23 @@ function render(){
 }
 function openCategoryModal(index=null){editingCategory=index;document.getElementById('categoryModalTitle').textContent=index===null?'New Category':'Edit Category';document.getElementById('categoryName').value=index===null?'':data[index].name;document.getElementById('categoryModal').classList.add('open')}
 function saveCategory(){const n=document.getElementById('categoryName').value.trim();if(!n)return alert('Category name লিখুন');if(editingCategory===null)data.push({name:n,items:[]});else data[editingCategory].name=n;save();closeModal('categoryModal');render()}
-function openTemplateModal(ci=null,ii=null){editingTemplate=(ci!==null&&ii!==null)?[ci,ii]:null;const s=document.getElementById('templateCategory');s.innerHTML='';data.forEach((c,i)=>{const o=document.createElement('option');o.value=i;o.textContent=categoryLabel(c.name);s.appendChild(o)});if(!data.length){alert('আগে একটি category তৈরি করুন');return}if(editingTemplate){const item=data[ci].items[ii];document.getElementById('templateModalTitle').textContent='Edit Template';s.value=ci;document.getElementById('templateTitle').value=item.title;document.getElementById('templateBody').value=item.body}else{document.getElementById('templateModalTitle').textContent='New Template';s.value=ci===null?active:ci;document.getElementById('templateTitle').value='';document.getElementById('templateBody').value=''}document.getElementById('templateModal').classList.add('open')}
+function openTemplateModal(ci=null,ii=null){editingTemplate=(ci!==null&&ii!==null)?[ci,ii]:null;const s=document.getElementById('templateCategory');s.innerHTML='';data.forEach((c,i)=>{const o=document.createElement('option');o.value=i;o.textContent=categoryLabel(c.name);s.appendChild(o)});if(!data.length){alert('আগে একটি category তৈরি করুন');return}if(editingTemplate){const item=data[ci].items[ii];document.getElementById('templateModalTitle').textContent='Edit Template';s.value=ci;document.getElementById('templateTitle').value=item.title;document.getElementById('templateBody').value=item.body}else{document.getElementById('templateModalTitle').textContent='New Template';s.value=ci===null?active:ci;document.getElementById('templateTitle').value='';document.getElementById('templateBody').value=''}document.getElementById('templateModalDelete').style.display=editingTemplate?'inline-block':'none';document.getElementById('templateModal').classList.add('open')}
 function saveTemplate(){const ci=+document.getElementById('templateCategory').value,t=document.getElementById('templateTitle').value.trim(),b=document.getElementById('templateBody').value.trim();if(!t||!b)return alert('Title এবং body লিখুন');const updated={title:t,body:b};if(editingTemplate){const [oldCi,ii]=editingTemplate;if(oldCi===ci){data[oldCi].items[ii]=updated}else{data[oldCi].items.splice(ii,1);data[ci].items.push(updated)}}else{data[ci].items.push(updated)}active=ci;save();closeModal('templateModal');render()}
+function deleteCurrentTemplate(){if(!editingTemplate)return;const [ci,ii]=editingTemplate;if(!confirm('এই template delete করবেন?'))return;data[ci].items.splice(ii,1);active=ci;save();closeModal('templateModal');render()}
 function generateExportHtml(){
   let html='<!doctype html>\n'+document.documentElement.outerHTML;
+  const attarStart=html.indexOf('const defaultAttars=');
+  const attarEnd=html.indexOf('\nlet limited3mlAttarNames',attarStart);
+  if(attarStart<0||attarEnd<0)throw new Error('Attar data block পাওয়া যায়নি');
+  html=html.slice(0,attarStart)+'const defaultAttars='+JSON.stringify(attars)+';'+html.slice(attarEnd);
   const dataStart=html.indexOf('const defaultData=');
   const dataEnd=html.indexOf('\nfunction normalizePlaceholders',dataStart);
   if(dataStart<0||dataEnd<0)throw new Error('Template data block পাওয়া যায়নি');
   html=html.slice(0,dataStart)+'const defaultData='+JSON.stringify(data)+';'+html.slice(dataEnd);
   const freshKey='arowaTemplateDataV10_'+Date.now();
   html=html.replace(/const STORAGE_KEY='[^']+';/,"const STORAGE_KEY='"+freshKey+"';");
+  const freshAttarKey='arowaAttarDataV1_'+Date.now();
+  html=html.replace(/const ATTAR_STORAGE_KEY='[^']+';/,"const ATTAR_STORAGE_KEY='"+freshAttarKey+"';");
   html=html.replace(/const savedLegacy=localStorage\.getItem\([^;]+;/,"const savedLegacy=null;");
   html=html.replace(/class="modal"/g,'class="modal"');
   return html;
@@ -430,9 +782,97 @@ async function copyExportHtml(){
 function openManager(){const box=document.getElementById('managerList');box.innerHTML='';data.forEach((c,ci)=>{const sec=document.createElement('div');sec.style.borderBottom='1px solid #eee';sec.style.padding='12px 0';sec.innerHTML=`<div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><strong>${categoryLabel(c.name)}</strong><div><button class="secondary">Edit Category</button> <button class="danger">Delete</button></div></div>`;const bs=sec.querySelectorAll('button');bs[0].onclick=()=>{closeModal('managerModal');openCategoryModal(ci)};bs[1].onclick=()=>deleteCategory(ci);c.items.forEach((it,ii)=>{const row=document.createElement('div');row.style.cssText='display:flex;justify-content:space-between;gap:8px;padding:8px 0 0 14px';row.innerHTML=`<span>${it.title}</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div>`;const rb=row.querySelectorAll('button');rb[0].onclick=()=>{closeModal('managerModal');openTemplateModal(ci,ii)};rb[1].onclick=()=>deleteTemplate(ci,ii);sec.appendChild(row)});box.appendChild(sec)});document.getElementById('managerModal').classList.add('open')}
 function deleteCategory(ci){if(!confirm('এই category এবং এর সব template delete করবেন?'))return;data.splice(ci,1);active=0;save();openManager();render()}
 function deleteTemplate(ci,ii){if(!confirm('এই template delete করবেন?'))return;data[ci].items.splice(ii,1);save();openManager();render()}
+function openAttarManager(){
+  const box=document.getElementById('attarManagerList');box.innerHTML='';
+  if(!attars.length){box.innerHTML='<p class="helper">কোনো আতর যোগ করা হয়নি।</p>'}
+  attars.forEach((a,i)=>{
+    const row=document.createElement('div');
+    row.style.cssText='display:flex;justify-content:space-between;gap:8px;align-items:center;padding:10px 0;border-bottom:1px solid #eee';
+    row.innerHTML=`<div><strong>${a.name}</strong><div class="helper">${priceLines(a).replace(/\n/g,' · ')}</div></div><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div>`;
+    const bs=row.querySelectorAll('button');
+    bs[0].onclick=()=>{closeModal('attarManagerModal');openAttarModal(i)};
+    bs[1].onclick=()=>deleteAttarAt(i);
+    box.appendChild(row);
+  });
+  document.getElementById('attarManagerModal').classList.add('open');
+}
+function openAttarModal(index=null){
+  editingAttar=index;
+  const a=index===null?{name:'',url:'',type:'',region:'',gender:'ইউনিসেক্স',longevity:'',projection:'',bagPolicy:'',prices:[],notes:{top:'',mid:'',base:''}}:attars[index];
+  document.getElementById('attarModalTitle').textContent=index===null?'New Attar':'Edit Attar';
+  document.getElementById('attarName').value=a.name||'';
+  document.getElementById('attarUrl').value=a.url||'';
+  document.getElementById('attarType').value=a.type||'';
+  document.getElementById('attarRegion').value=a.region||'';
+  document.getElementById('attarGender').value=a.gender||'';
+  document.getElementById('attarLongevity').value=a.longevity||'';
+  document.getElementById('attarProjection').value=a.projection||'';
+  document.getElementById('attarBagPolicy').value=a.bagPolicy||'';
+  document.getElementById('attarTop').value=a.notes?.top||'';
+  document.getElementById('attarMid').value=a.notes?.mid||'';
+  document.getElementById('attarBase').value=a.notes?.base||'';
+  document.getElementById('attarPrice3').value=getPrice(a,3)??'';
+  document.getElementById('attarPrice6').value=getPrice(a,6)??'';
+  document.getElementById('attarPrice12').value=getPrice(a,12)??'';
+  document.getElementById('attarModalDelete').style.display=index===null?'none':'inline-block';
+  document.getElementById('attarModal').classList.add('open');
+}
+function collectAttarPrices(){
+  const prices=[];
+  const p3=document.getElementById('attarPrice3').value;
+  const p6=document.getElementById('attarPrice6').value;
+  const p12=document.getElementById('attarPrice12').value;
+  if(p3!=='')prices.push([3,+p3]);
+  if(p6!=='')prices.push([6,+p6]);
+  if(p12!=='')prices.push([12,+p12]);
+  return prices;
+}
+function saveAttar(){
+  const name=document.getElementById('attarName').value.trim();
+  if(!name)return alert('আতরের নাম লিখুন');
+  const updated={
+    name,
+    url:document.getElementById('attarUrl').value.trim(),
+    longevity:document.getElementById('attarLongevity').value.trim(),
+    projection:document.getElementById('attarProjection').value.trim(),
+    prices:collectAttarPrices(),
+    type:document.getElementById('attarType').value.trim(),
+    region:document.getElementById('attarRegion').value.trim(),
+    bagPolicy:document.getElementById('attarBagPolicy').value.trim(),
+    gender:document.getElementById('attarGender').value.trim(),
+    notes:{top:document.getElementById('attarTop').value.trim(),mid:document.getElementById('attarMid').value.trim(),base:document.getElementById('attarBase').value.trim()}
+  };
+  if(editingAttar===null){
+    attars.push(updated);
+  }else{
+    const oldName=attars[editingAttar].name;
+    attars[editingAttar]=updated;
+    if(oldName!==updated.name){
+      const idx=limited3mlAttarNames.indexOf(oldName);
+      if(idx>=0)limited3mlAttarNames[idx]=updated.name;
+    }
+  }
+  saveAttars();
+  closeModal('attarModal');
+  render();
+}
+function deleteCurrentAttar(){if(editingAttar===null)return;deleteAttarAt(editingAttar,true)}
+function deleteAttarAt(index,fromEditModal){
+  if(!confirm('এই আতরটি delete করবেন? এটি dynamic template থেকেও বাদ পড়বে।'))return;
+  const removed=attars[index];
+  attars.splice(index,1);
+  const idx=limited3mlAttarNames.indexOf(removed.name);
+  if(idx>=0)limited3mlAttarNames.splice(idx,1);
+  saveAttars();
+  if(fromEditModal){closeModal('attarModal')}
+  openAttarManager();
+  render();
+}
 function closeModal(id){document.getElementById(id).classList.remove('open')}
-function resetData(){if(confirm('সব custom change মুছে default version ফিরিয়ে আনবেন?')){data=structuredClone(defaultData);active=0;save();render()}}
+function resetData(){if(confirm('সব custom change মুছে default version ফিরিয়ে আনবেন?')){data=structuredClone(defaultData);attars=structuredClone(defaultAttars);limited3mlAttarNames=["Baccarat Rouge","Vampire Blood","Musk Fakhir","Jafran Musk","Paris Hilton"];active=0;save();saveAttars();render()}}
 document.getElementById('search').addEventListener('keydown',e=>{if(e.key==='Escape'){e.target.value='';clearSearchFilters();render()}});
 render();
 </script>
+
+
 </body></html>
