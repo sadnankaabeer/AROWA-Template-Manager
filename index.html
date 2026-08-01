@@ -1,362 +1,6 @@
 <!doctype html>
 <html lang="bn"><head>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-    <script>
-      (function() {
-        // Capture host references before any artifact code runs: Window.parent
-        // is [Replaceable] (a top-level `var parent` in artifact code would
-        // replace the accessor with a data property), and a top-level
-        // `const crypto` would shadow the global — either would otherwise
-        // silently break the bridge for artifacts that worked before.
-        const realParent = window.parent;
-        const cryptoObj = window.crypto;
-        // crypto.randomUUID exists only in Secure Contexts; fall back to a
-        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
-        // uniqueness is what the bridge needs, unpredictability is
-        // defense-in-depth on top of the source guards.
-        const newRequestId =
-          cryptoObj && typeof cryptoObj.randomUUID === "function"
-            ? function () { return cryptoObj.randomUUID(); }
-            : function () { return Date.now() + "-" + Math.random(); };
-        const originalConsole = window.console;
-        window.console = {
-          log: (...args) => {
-            originalConsole.log(...args);
-            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
-          },
-          error: (...args) => {
-            originalConsole.error(...args);
-            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
-          },
-          warn: (...args) => {
-            originalConsole.warn(...args);
-            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
-          }
-        };
 
-        // Bridge request ids are crypto-random (not sequential) so they
-        // cannot be predicted by other frames in the tab.
-        let callbacksMap = new Map();
-        let streamControllers = new Map();
-        
-        window.claude = {
-          complete: (prompt) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
-            });
-          }
-        };
-
-        window.storage = {
-          get: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
-            });
-          },
-          set: (key, value, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
-            });
-          },
-          delete: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
-            });
-          },
-          list: (prefix, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
-            });
-          }
-        };
-
-        let pendingBlobs = new Map();
-        URL.createObjectURL = (blob) => {
-          // Store the blob and create an ID and URL for it
-          const blobId = `blob-${Date.now()}-${Math.random()}`;
-          pendingBlobs.set(blobId, blob);
-          return `blob-request://${blobId}`;
-        };
-
-        URL.revokeObjectURL = (url) => {
-          // Remove the blob from our store
-          const blobId = url.replace("blob-request://", "");
-          pendingBlobs.delete(blobId);
-        };
-
-        const getBlobFromURL = (url) => {
-          const blobId = url.replace("blob-request://", "");
-          return pendingBlobs.get(blobId);
-        };
-
-        // Override global fetch with streaming support
-        window.fetch = (url, init = {}) => {
-          return new Promise((resolve, reject) => {
-            const id = newRequestId();
-            const channelId = `fetch-${id}-${Date.now()}`;
-            
-            callbacksMap.set(id, { 
-              resolve: (response) => {
-                // Null-body statuses: Response(stream, {status: 204}) throws
-                // per the Fetch spec, which would escape this resolver and
-                // hang the artifact's await forever.
-                if (response.status === 204 || response.status === 205 || response.status === 304) {
-                  try {
-                    resolve(new Response(null, {
-                      status: response.status,
-                      statusText: response.statusText,
-                      headers: response.headers
-                    }));
-                  } catch (err) {
-                    // Invalid statusText/header bytes can throw here too.
-                    reject(new TypeError(
-                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                    ));
-                  }
-                  return;
-                }
-                // Create a ReadableStream for the response body
-                const stream = new ReadableStream({
-                  start(controller) {
-                    streamControllers.set(channelId, controller);
-                  },
-                  cancel() {
-                    streamControllers.delete(channelId);
-                  }
-                });
-                
-                // Create and return the Response with the stream. Response()
-                // requires status in [200, 599]; an opaque/no-cors fetch
-                // forwards status 0, which would throw here and escape the
-                // resolver, hanging the artifact's await. Surface it as a
-                // network-error-shaped rejection instead.
-                try {
-                  resolve(new Response(stream, {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: response.headers
-                  }));
-                } catch (err) {
-                  streamControllers.delete(channelId);
-                  reject(new TypeError(
-                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                  ));
-                }
-              },
-              reject,
-              channelId
-            });
-            
-            realParent.postMessage({
-              type: 'proxyFetch',
-              id,
-              url,
-              init,
-              channelId
-            }, '*');
-          });
-        };
-
-        window.addEventListener('message', async (event) => {
-          // Only the embedding parent may drive the bridge — sibling and
-          // nested frames can also postMessage into this window.
-          if (event.source !== realParent) return;
-          if (event.data.type === 'takeScreenshot') {
-            // Echo the request's nonce so the requester can correlate the
-            // reply to ITS request — a reply without the expected nonce
-            // (e.g. from a stale pre-remount artifact) is ignored upstream.
-            const screenshotNonce = event.data.nonce;
-            const rootElement = document.getElementById('artifacts-component-root-html');
-            if (!rootElement) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: new Error('Root element not found'),
-              }, '*');
-              return;
-            }
-            // Catch CDN load failures (htmlToImage undefined) and toPng errors
-            // so the parent always gets a response instead of hanging forever.
-            try {
-              const screenshot = await htmlToImage.toPng(rootElement, {
-                imagePlaceholder:
-                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
-              });
-              realParent.postMessage({
-                type: 'screenshotData',
-                nonce: screenshotNonce,
-                data: screenshot,
-              }, '*');
-            } catch (err) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: err instanceof Error ? err : new Error(String(err)),
-              }, '*');
-            }
-          } else if (event.data.type === 'claudeComplete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.completion);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'proxyFetchResponse') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-              callbacksMap.delete(event.data.id);
-            } else {
-              // Initial response with headers, status, etc.
-              callback.resolve({
-                status: event.data.status,
-                statusText: event.data.statusText,
-                headers: event.data.headers
-              });
-              // Don't delete the callback yet if streaming
-              if (!event.data.body) {
-                callbacksMap.delete(event.data.id);
-              }
-            }
-          } else if (event.data.type === 'proxyFetchStream') {
-            // Handle streaming data chunks
-            const controller = streamControllers.get(event.data.channelId);
-            if (controller) {
-              if (event.data.error) {
-                controller.error(new Error(event.data.error));
-                streamControllers.delete(event.data.channelId);
-              } else if (event.data.done) {
-                controller.close();
-                streamControllers.delete(event.data.channelId);
-                // Clean up the callback
-                const callback = Array.from(callbacksMap.entries()).find(
-                  ([_, value]) => value.channelId === event.data.channelId
-                );
-                if (callback) {
-                  callbacksMap.delete(callback[0]);
-                }
-              } else if (event.data.chunk) {
-                controller.enqueue(new Uint8Array(event.data.chunk));
-              }
-            }
-          } else if (event.data.type === 'storageGet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageSet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageDelete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageList') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          }
-        });
-
-        window.addEventListener('click', (event) => {
-          const isEl = event.target instanceof HTMLElement;
-          if (!isEl) return;
-    
-          // find ancestor links
-          const linkEl = event.target.closest("a");
-          if (!linkEl || !linkEl.href) return;
-    
-          event.preventDefault();
-          event.stopImmediatePropagation();
-    
-          if (linkEl.href.startsWith("blob-request:")) {
-            const blob = getBlobFromURL(linkEl.href);
-            if (!blob) return;
-            void blob.arrayBuffer().then((data) => {
-              realParent.postMessage({
-                type: "downloadFile",
-                filename: linkEl.download,
-                data,
-                mimeType: blob.type || "application/octet-stream",
-              });
-            });
-          } else if (linkEl.href.startsWith("data:")) {
-            const [header, base64Data] = linkEl.href.split(",");
-            const mimeMatch = header.match(/data:([^;]+)/);
-            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
-            const binaryString = atob(base64Data);
-            const data = Uint8Array.from(binaryString, (c) =>
-              c.charCodeAt(0),
-            ).buffer;
-            realParent.postMessage({
-              type: "downloadFile",
-              filename: linkEl.download,
-              data,
-              mimeType,
-            });
-          } else {
-            let linkUrl;
-            try {
-              linkUrl = new URL(linkEl.href);
-            } catch (error) {
-              return;
-            }
-    
-            if (linkUrl.hostname === window.location.hostname) return;
-      
-            realParent.postMessage({
-              type: 'openExternal',
-              href: linkEl.href,
-            }, '*');
-          }
-      });
-
-        const originalOpen = window.open;
-        window.open = function (url) {
-          realParent.postMessage({
-            type: "openExternal",
-            href: url,
-          }, "*");
-        };
-
-        window.addEventListener('error', (event) => {
-          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
-        });
-      })();
-    </script>
   
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AROWA Support Template Manager</title>
@@ -365,22 +9,30 @@
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,"Segoe UI","Noto Sans Bengali",sans-serif;background:var(--bg);color:var(--text)}
 header{position:sticky;top:0;z-index:20;background:#fff;border-bottom:1px solid var(--line)}.wrap{max-width:1240px;margin:auto;padding:18px}.top{display:flex;gap:14px;align-items:center;justify-content:space-between;flex-wrap:wrap}h1{margin:0;font-size:25px}.sub{margin:4px 0 0;color:var(--muted)}
 .actions{display:flex;gap:8px;flex-wrap:wrap}button{border:0;border-radius:9px;padding:10px 14px;background:var(--brand);color:#fff;font-weight:700;cursor:pointer}button.secondary{background:#fff;color:#344054;border:1px solid var(--line)}button.danger{background:var(--danger)}button.copied{background:var(--green)}
-.search{width:min(430px,100%);padding:12px 14px;border:1px solid #cfd6df;border-radius:10px;font-size:16px}.nav{display:flex;gap:8px;overflow:auto;padding:0 18px 14px;max-width:1240px;margin:auto}.nav button{white-space:nowrap;background:#fff;color:#344054;border:1px solid var(--line)}.nav button.active{background:var(--brand);color:#fff}.nav button.dragging{opacity:.45;border-style:dashed}.nav button.drag-over{border-color:#111827;box-shadow:0 0 0 3px rgba(17,24,39,.18)}.nav .add-category{min-width:44px;font-size:20px;padding:8px 13px;border-style:dashed}.cat-icon{margin-left:6px}.add-card{min-height:170px;border:2px dashed #cbd5e1;background:transparent;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:none}.add-card:hover{border-color:#64748b;background:#fff}.add-card-inner{text-align:center;color:#475467}.add-card-plus{width:44px;height:44px;border-radius:50%;display:grid;place-items:center;margin:0 auto 10px;background:#e2e8f0;color:#111827;font-size:28px;font-weight:500}.add-card strong{font-size:16px}
+.search{width:min(430px,100%);padding:12px 14px;border:1px solid #cfd6df;border-radius:10px;font-size:16px}.nav{display:flex;gap:8px;overflow:auto;padding:0 18px 14px;max-width:1240px;margin:auto;scroll-behavior:auto;overscroll-behavior-x:contain;scrollbar-width:thin}.nav button{white-space:nowrap;background:#fff;color:#344054;border:1px solid var(--line)}.nav button.active{background:var(--brand);color:#fff}.nav button.dragging{opacity:.45;border-style:dashed}.nav button.drag-over{border-color:#111827;box-shadow:0 0 0 3px rgba(17,24,39,.18)}.nav .add-category{min-width:44px;font-size:20px;padding:8px 13px;border-style:dashed}.cat-icon{margin-left:6px}.add-card{min-height:170px;border:2px dashed #cbd5e1;background:transparent;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:none}.add-card:hover{border-color:#64748b;background:#fff}.add-card-inner{text-align:center;color:#475467}.add-card-plus{width:44px;height:44px;border-radius:50%;display:grid;place-items:center;margin:0 auto 10px;background:#e2e8f0;color:#111827;font-size:28px;font-weight:500}.add-card strong{font-size:16px}
 .notice{background:#fffbeb;border:1px solid #fde68a;color:#7c5c09;padding:12px 14px;border-radius:12px;margin-bottom:15px}.toolbar{display:flex;justify-content:space-between;gap:10px;align-items:center;margin:10px 0 16px;flex-wrap:wrap}.count{color:var(--muted);font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:16px}.card{background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px;box-shadow:0 4px 18px rgba(15,23,42,.045);cursor:pointer;transition:transform .15s ease,border-color .15s ease,box-shadow .15s ease,background .15s ease}.card:not(.add-card):hover{transform:translateY(-2px);border-color:#aab4c3;box-shadow:0 8px 24px rgba(15,23,42,.09);background:#fcfdff}.card.copy-flash{transform:scale(.992);border-color:var(--green);box-shadow:0 0 0 3px rgba(21,128,61,.12)}.card.dragging{opacity:.45;transform:scale(.985);border-style:dashed}.card.drag-over{border-color:#111827;box-shadow:0 0 0 3px rgba(17,24,39,.12)}.card-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.card h3{margin:0;font-size:17px}.mini-actions{display:flex;gap:6px}.mini-actions button{padding:7px 10px;font-size:12px}.tag{display:inline-block;margin:8px 0;font-size:12px;padding:4px 8px;border-radius:999px;background:#eef2ff;color:#3730a3}select,input,textarea{font:inherit}select{width:100%;padding:10px;border:1px solid #cfd6df;border-radius:9px;margin:10px 0}pre{white-space:pre-wrap;word-break:break-word;background:var(--soft);padding:14px;border-radius:10px;line-height:1.7;margin:10px 0 0}
 .modal{position:fixed;inset:0;background:rgba(15,23,42,.5);display:none;align-items:center;justify-content:center;padding:18px;z-index:50}.modal.open{display:flex}.panel{width:min(760px,100%);max-height:90vh;overflow:auto;background:#fff;border-radius:16px;padding:20px}.panel h2{margin-top:0}label{display:block;font-weight:700;margin:12px 0 6px}input[type=text],textarea{width:100%;padding:11px;border:1px solid #cfd6df;border-radius:9px}textarea{min-height:220px;resize:vertical}.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}.helper{font-size:13px;color:var(--muted);line-height:1.5}.empty{text-align:center;color:var(--muted);padding:40px}.copy-toast{position:fixed;left:50%;bottom:28px;transform:translate(-50%,18px);background:#111827;color:#fff;padding:11px 18px;border-radius:999px;font-weight:700;opacity:0;pointer-events:none;transition:.2s ease;z-index:100;box-shadow:0 10px 30px rgba(15,23,42,.25)}.copy-toast.show{opacity:1;transform:translate(-50%,0)}
 .export-menu{position:relative;display:inline-flex}.export-menu>button:first-child{border-radius:9px 0 0 9px}.export-menu-toggle{border-radius:0 9px 9px 0!important;padding-left:10px!important;padding-right:10px!important;border-left:0!important}.export-dropdown{position:absolute;right:0;top:calc(100% + 7px);min-width:190px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:6px;box-shadow:0 12px 30px rgba(15,23,42,.16);display:none;z-index:40}.export-dropdown.open{display:block}.export-dropdown a{display:block;padding:10px 12px;border-radius:8px;color:#172033;text-decoration:none;font-weight:700}.export-dropdown a:hover{background:#f1f5f9}.reload-status{font-size:12px;color:var(--muted);align-self:center;white-space:nowrap}
 
 .search-wrap{position:relative;width:min(430px,100%)}.search-wrap .search{width:100%;padding-right:48px}.search-filter-btn{position:absolute;right:5px;top:5px;width:38px;height:38px;padding:0;border-radius:8px;background:#fff;color:#344054;border:1px solid var(--line);font-size:17px}.search-filter-btn.active{background:var(--brand);color:#fff}.search-filters{position:absolute;right:0;top:calc(100% + 8px);width:min(560px,94vw);background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px;box-shadow:0 14px 34px rgba(15,23,42,.18);display:none;z-index:45}.search-filters.open{display:block}.search-filter-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.search-filter-grid select,.search-filter-grid input{margin:0;width:100%;padding:10px;border:1px solid #cfd6df;border-radius:9px;background:#fff}.search-filter-actions{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:10px}.search-filter-note{font-size:12px;color:var(--muted)}.result-section-title{grid-column:1/-1;font-size:14px;font-weight:800;color:#475467;margin-top:2px}.attar-result{background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px;box-shadow:0 4px 18px rgba(15,23,42,.045);cursor:pointer}.attar-result:hover{transform:translateY(-2px);border-color:#aab4c3;box-shadow:0 8px 24px rgba(15,23,42,.09)}.attar-result h3{margin:0 0 8px;font-size:17px}.attar-meta{font-size:13px;color:var(--muted);line-height:1.55}.attar-price{font-weight:800;margin-top:10px}.smell-badge{display:inline-block;margin-left:6px;padding:3px 7px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:11px;font-weight:700}@media(max-width:650px){.search-wrap{width:100%}.search-filter-grid{grid-template-columns:1fr}}
-@media(max-width:650px){.wrap{padding:14px}.grid{grid-template-columns:1fr}h1{font-size:21px}.search{width:100%}}
+
+.dark-mode-icon{position:fixed;top:14px;right:14px;z-index:80;width:40px;height:40px;border-radius:50%;padding:0;display:grid;place-items:center;background:var(--card);color:var(--text);border:1px solid var(--line);box-shadow:0 8px 24px rgba(15,23,42,.16);font-size:19px;line-height:1}.dark-mode-icon:hover{transform:translateY(-1px)}
+.recent-clear{margin-left:6px;padding:5px 8px;border-radius:999px;background:transparent!important;color:var(--muted)!important;border:1px solid var(--line)!important;font-size:11px;font-weight:700}.recent-clear:hover{color:var(--danger)!important;border-color:var(--danger)!important}
+@media(max-width:650px){.dark-mode-icon{top:10px;right:10px;width:36px;height:36px}.wrap{padding:14px}.grid{grid-template-columns:1fr}h1{font-size:21px}.search{width:100%}}
 .price-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
 .price-grid label{margin:0 0 6px}
 .attar-card .attar-meta{font-size:13px;color:var(--muted);line-height:1.55;margin-top:6px}
 .attar-card pre{margin-top:10px}
 .nav button.attars-tab{font-weight:800}
+body.dark{--bg:#0f172a;--card:#111827;--text:#e5e7eb;--muted:#94a3b8;--line:#334155;--brand:#f8fafc;--soft:#1e293b;--green:#22c55e;--danger:#dc2626;background:var(--bg);color:var(--text)}
+body.dark header,body.dark .panel,body.dark .card,body.dark .attar-result,body.dark .search-filters,body.dark .export-dropdown{background:#111827;color:#e5e7eb}body.dark button.secondary,body.dark input,body.dark select,body.dark textarea{background:#0f172a;color:#e5e7eb;border-color:#334155}body.dark .nav button{background:#111827;color:#e5e7eb;border-color:#334155}body.dark .nav button.active{background:#f8fafc;color:#111827}body.dark .tag{background:#312e81;color:#e0e7ff}
+.recent-wrap{max-width:1240px;margin:0 auto;padding:10px 18px 0}.recent-wrap[hidden]{display:none}.recent-title{font-size:12px;color:var(--muted);margin-right:8px}.recent-chips{display:flex;gap:7px;flex-wrap:wrap;align-items:center}.recent-chip{padding:7px 10px!important;font-size:12px!important;border-radius:999px!important;background:#fff!important;color:#344054!important;border:1px solid var(--line)!important}.recent-chip:hover{border-color:#64748b!important}.undo-toast{position:fixed;left:50%;bottom:28px;transform:translate(-50%,18px);background:#111827;color:#fff;padding:10px 12px 10px 16px;border-radius:999px;display:flex;align-items:center;gap:12px;opacity:0;pointer-events:none;transition:.2s;z-index:120;box-shadow:0 10px 30px rgba(0,0,0,.3)}.undo-toast.show{opacity:1;transform:translate(-50%,0);pointer-events:auto}.undo-toast button{padding:6px 10px;background:#fff;color:#111827}
+.attar-inline{display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}.attar-card.expanded{grid-column:span 2;align-self:start}.attar-card.expanded .attar-inline{display:block}.inline-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.inline-field label{font-size:11px;margin:0 0 4px}.inline-field input,.inline-field textarea{width:100%;margin:0;min-height:auto;padding:8px 9px}.inline-field textarea{height:58px;resize:vertical}.inline-span-3{grid-column:1/-1}.inline-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:10px}.inline-actions button{padding:8px 11px}.expand-btn{font-size:16px!important;padding:5px 10px!important}.duplicate{white-space:nowrap}@media(max-width:700px){.inline-grid{grid-template-columns:1fr}.inline-span-3{grid-column:auto}.attar-card.expanded{grid-column:span 1}}
 </style></head>
-<body id="artifacts-component-root-html">
+<body id="artifacts-component-root-html" class=""><button id="darkModeBtn" class="dark-mode-icon" onclick="toggleDarkMode()" title="Dark mode" aria-label="Switch to dark mode">🌙</button>
 <header><div class="wrap top"><div><h1>AROWA Template Manager</h1><p class="sub">Product, order, inbox ও support reply এক জায়গা থেকে manage করুন।</p></div><div class="search-wrap" id="searchWrap"><input id="search" class="search" placeholder="Template খুঁজুন..." oninput="render()"><button class="search-filter-btn" id="searchFilterBtn" onclick="toggleSearchFilters(event)" title="Search filters" style="display: none;">⚙</button><div class="search-filters" id="searchFilters"><div class="search-filter-grid"><select id="smellLevel" onchange="render()"><option value="">সব ঘ্রাণ</option><option value="light">হালকা ঘ্রাণ</option><option value="medium">মাঝারি ঘ্রাণ</option><option value="strong">ঘাড়ো / শক্ত ঘ্রাণ</option></select><select id="mlFilter" onchange="render()"><option value="">সব মিলি</option><option value="3">৩ মিলি</option><option value="6">৬ মিলি</option><option value="12">১২ মিলি</option></select><input id="minPrice" type="number" min="0" placeholder="সর্বনিম্ন দাম" oninput="render()"><input id="maxPrice" type="number" min="0" placeholder="সর্বোচ্চ দাম" oninput="render()"><select id="typeFilter" onchange="render()"><option value="">সব ধরন</option><option value="100% Pure">100% Pure</option><option value="Synthetic">Synthetic</option></select><select id="sortFilter" onchange="render()"><option value="">Default sorting</option><option value="priceAsc">দাম কম থেকে বেশি</option><option value="priceDesc">দাম বেশি থেকে কম</option></select></div><div class="search-filter-actions"><span class="search-filter-note">শুধু Attars ট্যাবে এই filter কাজ করবে</span><button class="secondary" onclick="clearSearchFilters(event)">Clear filters</button></div></div></div></div><div id="nav" class="nav"><button class="active" title="Hold করে drag করলে category-এর position পরিবর্তন হবে" draggable="true">Product &amp; Price<span class="cat-icon">🏷️</span></button><button class="" title="Hold করে drag করলে category-এর position পরিবর্তন হবে" draggable="true">Order &amp; Inbox<span class="cat-icon">📥</span></button><button class="" title="Hold করে drag করলে category-এর position পরিবর্তন হবে" draggable="true">Delivery &amp; Return<span class="cat-icon">🚚</span></button><button class="" title="Hold করে drag করলে category-এর position পরিবর্তন হবে" draggable="true">Bag &amp; Gift<span class="cat-icon">🎁</span></button><button class="" title="Hold করে drag করলে category-এর position পরিবর্তন হবে" draggable="true">3 ml Policy<span class="cat-icon">🧴</span></button><button class="" title="Hold করে drag করলে category-এর position পরিবর্তন হবে" draggable="true">Product Details<span class="cat-icon">📋</span></button><button class="" title="Hold করে drag করলে category-এর position পরিবর্তন হবে" draggable="true">Follow-up<span class="cat-icon">🔔</span></button><button class="" title="Hold করে drag করলে category-এর position পরিবর্তন হবে" draggable="true">আতর ব্যবহারের নিয়ম<span class="cat-icon">📖</span></button><button class="attars-tab">Attars<span class="cat-icon">🧴</span></button><button class="add-category" title="New Category">+</button></div></header>
-<main class="wrap"><div class="toolbar"><div id="count" class="count">Product &amp; Price 🏷️ category-তে 13টি template দেখা যাচ্ছে</div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="secondary" onclick="openManager()">Manage / Delete</button><div class="export-menu" id="exportMenu"><button class="secondary" onclick="openHtmlExport()">Copy HTML Code</button><button class="secondary export-menu-toggle" onclick="toggleExportMenu(event)" title="More options">▾</button><div class="export-dropdown" id="exportDropdown"><a href="https://github.com/sadnankaabeer/AROWA-Template-Manager/edit/main/index.html" target="_blank" rel="noopener noreferrer">Edit GitHub</a></div></div><button class="secondary" onclick="resetData()">Reset to Default</button><span id="reloadStatus" class="reload-status">Auto reload: waiting</span></div></div><div id="grid" class="grid"><article class="card" draggable="true" data-index="0" title="Hold করে drag করলে template-এর position পরিবর্তন হবে"><div class="card-head"><div><h3>নতুন মেসেজ শুরু, স্যার</h3><span class="tag">29টি আতর select করা যাবে — selector-এর ওপর scroll করলে বদলাবে</span></div><div class="mini-actions"><button class="secondary edit">Edit</button></div></div><select><option value="0">1. Musk Al Shafaq</option><option value="1">2. Musk Al Tahara</option><option value="2">3. Khamrah</option><option value="3">4. Khamrah Qawa</option><option value="4">5. Bianco Latte</option><option value="5">6. Saffron</option><option value="6">7. Ruh Khus</option><option value="7">8. White/Absolute Lotus</option><option value="8">9. Kasturi</option><option value="9">10. Kasturi - Deer Musk</option><option value="10">11. Black Rose</option><option value="11">12. Ruh Gulab (100% Pure)</option><option value="12">13. Ruh Gulab (Synthetic)</option><option value="13">14. Moroccan Rose</option><option value="14">15. Palanpuri Rose</option><option value="15">16. Wardia Crystal Rose</option><option value="16">17. Smoky Oud</option><option value="17">18. Rose de Mai</option><option value="18">19. Oud - Sylheti</option><option value="19">20. Oud - Sylheti (Dehn Al Oud)</option><option value="20">21. Dehn Al Oud Suyufi</option><option value="21">22. Amber Oudh</option><option value="22">23. Mesk e Amber</option><option value="23">24. Mysore Sandal</option><option value="24">25. Baccarat Rouge</option><option value="25">26. Vampire Blood</option><option value="26">27. Musk Fakhir</option><option value="27">28. Jafran Musk</option><option value="28">29. Paris Hilton</option></select><pre>স্যার,
+<div id="recentWrap" class="recent-wrap" hidden=""><div class="recent-chips"><span class="recent-title">Recently copied</span><span id="recentChips"></span></div></div>
+<main class="wrap"><div class="toolbar"><div id="count" class="count">Product &amp; Price 🏷️ category-তে 13টি template দেখা যাচ্ছে</div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="secondary" onclick="openManager()">Manage / Delete</button><div class="export-menu" id="exportMenu"><button class="secondary" onclick="openHtmlExport()">Copy HTML Code</button><button class="secondary export-menu-toggle" onclick="toggleExportMenu(event)" title="More options">▾</button><div class="export-dropdown" id="exportDropdown"><a href="https://github.com/sadnankaabeer/AROWA-Template-Manager/edit/main/index.html" target="_blank" rel="noopener noreferrer">Edit GitHub</a></div></div><button class="secondary" onclick="resetData()">Reset to Default</button><span id="reloadStatus" class="reload-status">Auto reload: on</span></div></div><div id="grid" class="grid"><article class="card" draggable="true" data-index="0" title="Hold করে drag করলে template-এর position পরিবর্তন হবে"><div class="card-head"><div><h3>নতুন মেসেজ শুরু, স্যার</h3><span class="tag">29টি আতর select করা যাবে — selector-এর ওপর scroll করলে বদলাবে</span></div><div class="mini-actions"><button class="secondary edit">Edit</button></div></div><select><option value="0">1. Musk Al Shafaq</option><option value="1">2. Musk Al Tahara</option><option value="2">3. Khamrah</option><option value="3">4. Khamrah Qawa</option><option value="4">5. Bianco Latte</option><option value="5">6. Saffron</option><option value="6">7. Ruh Khus</option><option value="7">8. White/Absolute Lotus</option><option value="8">9. Kasturi</option><option value="9">10. Kasturi - Deer Musk</option><option value="10">11. Black Rose</option><option value="11">12. Ruh Gulab (100% Pure)</option><option value="12">13. Ruh Gulab (Synthetic)</option><option value="13">14. Moroccan Rose</option><option value="14">15. Palanpuri Rose</option><option value="15">16. Wardia Crystal Rose</option><option value="16">17. Smoky Oud</option><option value="17">18. Rose de Mai</option><option value="18">19. Oud - Sylheti</option><option value="19">20. Oud - Sylheti (Dehn Al Oud)</option><option value="20">21. Dehn Al Oud Suyufi</option><option value="21">22. Amber Oudh</option><option value="22">23. Mesk e Amber</option><option value="23">24. Mysore Sandal</option><option value="24">25. Baccarat Rouge</option><option value="25">26. Vampire Blood</option><option value="26">27. Musk Fakhir</option><option value="27">28. Jafran Musk</option><option value="28">29. Paris Hilton</option></select><pre>স্যার,
 ৩ মিলি: ৳৬৫০
 ৬ মিলি: ৳১,০৯৯
 ১২ মিলি: ৳২,০৯৯
@@ -450,8 +102,9 @@ https://arowabd.com/bn
 
 ধন্যবাদ।</pre></article><article class="card" draggable="true" data-index="11" title="Hold করে drag করলে template-এর position পরিবর্তন হবে"><div class="card-head"><div><h3>Anyone available in chat মেসেজ করলে?</h3></div><div class="mini-actions"><button class="secondary edit">Edit</button></div></div><pre>আসসালামু আলাইকুম!
 
-স্যার, বলুন আতর সংক্রান্ত কোন বিষয়ে আপনাকে সহযোগিতা করতে পারি?</pre></article><article class="card" draggable="true" data-index="12" title="Hold করে drag করলে template-এর position পরিবর্তন হবে"><div class="card-head"><div><h3>কথা বুঝিনি</h3></div><div class="mini-actions"><button class="secondary edit">Edit</button></div></div><pre>দুঃখিত স্যার, আপনার কথাটি বুঝতে পারিনি। একটু বিস্তারিতভাবে বলবেন?</pre></article><article class="card add-card"><div class="add-card-inner"><div class="add-card-plus">+</div><strong>Add New Template</strong><div class="helper">এই category-তে নতুন template যোগ করুন</div></div></article></div><div id="empty" class="empty" style="display:none">কোনো template পাওয়া যায়নি।</div></main>
+স্যার, বলুন আতর সংক্রান্ত কোন বিষয়ে আপনাকে সহযোগিতা করতে পারি?</pre></article><article class="card" draggable="true" data-index="12" title="Hold করে drag করলে template-এর position পরিবর্তন হবে"><div class="card-head"><div><h3>কথা বুঝিনি</h3></div><div class="mini-actions"><button class="secondary edit">Edit</button></div></div><pre>দুঃখিত স্যার, আপনার কথাটি বুঝতে পারিনি। একটু বিস্তারিতভাবে বলবেন?</pre></article><article class="card add-card"><div class="add-card-inner"><div class="add-card-plus">+</div><strong>Add New Template</strong><div class="helper">নতুন template যোগ করুন অথবা আগেরটি duplicate করুন</div><div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:12px"><button class="secondary add-new-template">Add Template</button><button class="secondary duplicate-existing-template">Duplicate Template</button></div></div></article></div><div id="empty" class="empty" style="display:none">কোনো template পাওয়া যায়নি।</div></main>
 <div id="copyToast" class="copy-toast">✓ কপি হয়েছে</div>
+<div id="undoToast" class="undo-toast"><span id="undoMessage">Deleted</span><button onclick="performUndo()">Undo</button></div>
 
 <div id="categoryModal" class="modal"><div class="panel"><h2 id="categoryModalTitle">New Category</h2><label>Category name</label><input id="categoryName" type="text"><div class="modal-actions"><button class="secondary" onclick="closeModal('categoryModal')">Cancel</button><button onclick="saveCategory()">Save</button></div></div></div>
 <div id="templateModal" class="modal"><div class="panel"><h2 id="templateModalTitle">New Template</h2><label>Category</label><select id="templateCategory"><option value="0">Product &amp; Price 🏷️</option><option value="1">Order &amp; Inbox 📥</option><option value="2">Delivery &amp; Return 🚚</option><option value="3">Bag &amp; Gift 🎁</option><option value="4">3 ml Policy 🧴</option><option value="5">Product Details 📋</option><option value="6">আতর ব্যবহারের নিয়ম 📖</option><option value="7">Follow-up 🔔</option></select><label>Template title</label><input id="templateTitle" type="text"><label>Template body</label><textarea id="templateBody"></textarea><p class="helper">Dynamic reply বানাতে placeholders: {{{attar}}}, {{{priceLines}}}, {{{price3ml}}}, {{{price12}}}, {{{total12}}}, {{{url}}}, {{{longevity}}}, {{{projection}}}, {{{type}}}, {{{region}}}, {{{bagPolicy}}}, {{{gender}}}, {{{topNote}}}, {{{midNote}}}, {{{baseNote}}}, {{{notes}}}, {{{allAttars}}}, {{{allPrices}}}। {{attar}} বা {{priceLines}}-সহ যেকোনো product placeholder থাকলে আতরের selector স্বয়ংক্রিয়ভাবে দেখাবে।</p><div class="modal-actions"><button class="danger" id="templateModalDelete" style="display:none;margin-right:auto" onclick="deleteCurrentTemplate()">Delete</button><button class="secondary" onclick="closeModal('templateModal')">Cancel</button><button onclick="saveTemplate()">Save</button></div></div></div>
@@ -618,8 +271,8 @@ Base · শেষে: {{baseNote}}
   });
   return migrated;
 }
-const STORAGE_KEY='arowaTemplateDataV10_1785600235974';
-const ATTAR_STORAGE_KEY='arowaAttarDataV1_1785600235974';
+const STORAGE_KEY='arowaTemplateDataV10_1785603380213';
+const ATTAR_STORAGE_KEY='arowaAttarDataV1_1785603380213';
 const savedCurrent=localStorage.getItem(STORAGE_KEY);
 const savedLegacy=null;
 let data;
@@ -642,6 +295,18 @@ if(savedAttars){
 }
 let active=0;let editingCategory=null;let editingTemplate=null;let editingAttar=null;let dragState=null;let attarDragState=null;let catDragState=null;let suppressCopyUntil=0;let attarsTabActive=false;
 const supportsHoverPointer=!!(window.matchMedia&&matchMedia('(hover: hover) and (pointer: fine)').matches);
+const RECENT_KEY='arowaRecentlyCopiedV1';
+const DARK_KEY='arowaDarkModeV1';
+let recentCopied=JSON.parse(localStorage.getItem(RECENT_KEY)||'[]');
+let undoState=null,undoTimer=null,expandedAttarIndex=null;
+function applyDarkMode(){const dark=localStorage.getItem(DARK_KEY)==='1';document.body.classList.toggle('dark',dark);const b=document.getElementById('darkModeBtn');if(b){b.textContent=dark?'☀️':'🌙';b.title=dark?'Light mode':'Dark mode';b.setAttribute('aria-label',dark?'Switch to light mode':'Switch to dark mode')}}
+function toggleDarkMode(){localStorage.setItem(DARK_KEY,document.body.classList.contains('dark')?'0':'1');applyDarkMode()}
+function addRecent(label,text,type='template'){recentCopied=recentCopied.filter(x=>x.text!==text);recentCopied.unshift({label,text,type});recentCopied=recentCopied.slice(0,6);localStorage.setItem(RECENT_KEY,JSON.stringify(recentCopied));renderRecent()}
+function clearRecentCopied(){recentCopied=[];localStorage.removeItem(RECENT_KEY);renderRecent()}
+function renderRecent(){const wrap=document.getElementById('recentWrap'),box=document.getElementById('recentChips'),q=document.getElementById('search')?.value.trim();if(!wrap||!box)return;wrap.hidden=!!q||!recentCopied.length;box.innerHTML='';recentCopied.forEach(x=>{const b=document.createElement('button');b.className='recent-chip';b.textContent=x.label;b.onclick=()=>copyText(x.text,null,x.label,x.type);box.appendChild(b)});if(recentCopied.length){const clear=document.createElement('button');clear.className='recent-clear';clear.textContent='Clear';clear.title='Clear recently copied';clear.onclick=clearRecentCopied;box.appendChild(clear)}}
+function showUndo(message,restore){undoState=restore;clearTimeout(undoTimer);document.getElementById('undoMessage').textContent=message;document.getElementById('undoToast').classList.add('show');undoTimer=setTimeout(()=>{undoState=null;document.getElementById('undoToast').classList.remove('show')},6000)}
+function performUndo(){if(undoState)undoState();undoState=null;clearTimeout(undoTimer);document.getElementById('undoToast').classList.remove('show')}
+applyDarkMode();
 save();saveAttars();
 function save(){localStorage.setItem(STORAGE_KEY,JSON.stringify(data))}
 function saveAttars(){localStorage.setItem(ATTAR_STORAGE_KEY,JSON.stringify(attars))}
@@ -658,7 +323,7 @@ const categoryIcons={
 "Product & Price":"🏷️","Order & Inbox":"📥","Delivery & Return":"🚚","Bag & Gift":"🎁","3 ml Policy":"🧴","Product Details":"📋","Follow-up":"🔔","আতর ব্যবহারের নিয়ম":"📖"
 };
 function categoryLabel(name){return `${name} ${categoryIcons[name]||"📁"}`}
-async function copyText(text,card){try{await navigator.clipboard.writeText(text)}catch(e){const t=document.createElement('textarea');t.value=text;document.body.appendChild(t);t.select();document.execCommand('copy');t.remove()}if(card){card.classList.add('copy-flash');setTimeout(()=>card.classList.remove('copy-flash'),260)}const toast=document.getElementById('copyToast');toast.classList.add('show');clearTimeout(window.copyToastTimer);window.copyToastTimer=setTimeout(()=>toast.classList.remove('show'),1100)}
+async function copyText(text,card,label=null,type='template'){try{await navigator.clipboard.writeText(text)}catch(e){const t=document.createElement('textarea');t.value=text;document.body.appendChild(t);t.select();document.execCommand('copy');t.remove()}if(card){card.classList.add('copy-flash');setTimeout(()=>card.classList.remove('copy-flash'),260);label=label||card.querySelector('h3')?.textContent||'Copied'}if(label)addRecent(label,text,type);const toast=document.getElementById('copyToast');toast.classList.add('show');clearTimeout(window.copyToastTimer);window.copyToastTimer=setTimeout(()=>toast.classList.remove('show'),1100)}
 function smellStrength(a){
   const text=[a.name,a.projection,a.notes.top,a.notes.mid,a.notes.base].join(' ').toLowerCase();
   const strong=['strong','heavy','deep','smoky','oud','animalic','leather','warm spicy','resin','intense','ঘাড়ো','কড়া','ভারী','চড়া'];
@@ -682,7 +347,7 @@ function hasSearchFilters(f=getSearchFilterState()){return !!(f.smell||f.ml||f.m
 function filteredAttars(q){
   const f=getSearchFilterState();
   let results=attars.filter(a=>{
-    if(q&&!attarSearchText(a).includes(q))return false;
+    if(q){const tokens=q.split(/\s+/).filter(Boolean);const searchable=attarSearchText(a);if(!tokens.every(t=>searchable.includes(t)))return false;}
     if(f.smell&&smellStrength(a)!==f.smell)return false;
     if(f.type&&a.type!==f.type)return false;
     if(f.ml&&!a.prices.some(p=>p[0]===f.ml))return false;
@@ -726,10 +391,8 @@ function render(){
  }
  searchInput.placeholder=attarsTabActive?'আতর, ঘ্রাণ বা দাম খুঁজুন...':'Template খুঁজুন...';
 
- if(attarsTabActive){
-   renderAttarsTab(q);
-   return;
- }
+ if(attarsTabActive){renderAttarsTab(q);return;}
+ renderRecent();
 
  if(!data.length){document.getElementById('empty').style.display='block';document.getElementById('count').textContent='কোনো category নেই';return}
 
@@ -775,7 +438,7 @@ function render(){
    grid.appendChild(card);
  });
 
- if(!q){const add=document.createElement('article');add.className='card add-card';add.innerHTML='<div class="add-card-inner"><div class="add-card-plus">+</div><strong>Add New Template</strong><div class="helper">এই category-তে নতুন template যোগ করুন</div></div>';add.onclick=()=>openTemplateModal(active,null);grid.appendChild(add)}
+ if(!q){const add=document.createElement('article');add.className='card add-card';add.innerHTML='<div class="add-card-inner"><div class="add-card-plus">+</div><strong>Add New Template</strong><div class="helper">নতুন template যোগ করুন অথবা আগেরটি duplicate করুন</div><div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:12px"><button class="secondary add-new-template">Add Template</button><button class="secondary duplicate-existing-template">Duplicate Template</button></div></div>';add.querySelector('.add-new-template').onclick=e=>{e.stopPropagation();openTemplateModal(active,null)};add.querySelector('.duplicate-existing-template').onclick=e=>{e.stopPropagation();openDuplicatePicker(active)};grid.appendChild(add)}
  const count=document.getElementById('count');
  count.textContent=`${categoryLabel(data[active].name)} category-তে ${entries.length}টি template দেখা যাচ্ছে`;
  document.getElementById('empty').style.display=entries.length?'none':'block';
@@ -788,42 +451,66 @@ function renderAttarsTab(q){
  const list=isFiltered?filteredAttars(query):attars;
  grid.innerHTML='';
  list.forEach(a=>{
-   const index=attars.indexOf(a);
-   const card=document.createElement('article');card.className='card attar-card';
-   const draggableNow=!isFiltered;
-   card.draggable=draggableNow;
-   card.dataset.index=index;
-   card.title=draggableNow?'Hold করে drag করলে আতরের position পরিবর্তন হবে':'Search/filter থাকা অবস্থায় reorder করা যাবে না';
-   card.innerHTML=`<div class="card-head"><div><h3></h3><span class="tag"></span></div><div class="mini-actions"><button class="secondary edit">Edit</button><button class="danger delete">Delete</button></div></div><div class="attar-meta"></div><pre></pre>`;
-   card.querySelector('h3').textContent=a.name;
-   card.querySelector('.tag').textContent=`${a.type||'ধরন উল্লেখ নেই'} · ${a.gender||''}`;
+   const index=attars.indexOf(a), expanded=expandedAttarIndex===index;
+   const card=document.createElement('article');card.className='card attar-card'+(expanded?' expanded':'');
+   const draggableNow=!isFiltered&&!expanded;card.draggable=draggableNow;card.dataset.index=index;
+   card.title=draggableNow?'Hold করে drag করলে আতরের position পরিবর্তন হবে':'Search/filter/edit অবস্থায় reorder করা যাবে না';
+   card.innerHTML=`<div class="card-head"><div><h3></h3><span class="tag"></span></div><div class="mini-actions"><button class="secondary expand-btn">${expanded?'▴':'▾'}</button></div></div><div class="attar-meta"></div><pre></pre><div class="attar-inline"></div>`;
+   card.querySelector('h3').textContent=a.name;card.querySelector('.tag').textContent=`${a.type||'ধরন উল্লেখ নেই'} · ${a.gender||''}`;
    card.querySelector('.attar-meta').textContent=`স্থায়িত্ব: ${a.longevity||'তথ্য নেই'}  ·  Top: ${a.notes.top}  ·  Mid: ${a.notes.mid}  ·  Base: ${a.notes.base}`;
-   const priceText=priceLines(a);
-   card.querySelector('pre').textContent=priceText;
-   card.onclick=e=>{if(Date.now()<suppressCopyUntil||e.target.closest('button'))return;copyText(`${a.name} আতরঃ\n\n${priceText}\n\nলংজেভিটি: ${a.longevity}\nTop: ${a.notes.top}\nMid: ${a.notes.mid}\nBase: ${a.notes.base}`,card)};
-   card.querySelector('.edit').onclick=e=>{e.stopPropagation();openAttarModal(index)};
-   card.querySelector('.delete').onclick=e=>{e.stopPropagation();deleteAttarAt(index)};
+   const priceText=priceLines(a);card.querySelector('pre').textContent=priceText;
+   card.onclick=e=>{if(Date.now()<suppressCopyUntil||e.target.closest('button,input,textarea,select,label'))return;copyText(`${a.name} আতরঃ\n\n${priceText}\n\nলংজেভিটি: ${a.longevity}\nTop: ${a.notes.top}\nMid: ${a.notes.mid}\nBase: ${a.notes.base}`,card,a.name,'attar')};
+   card.querySelector('.expand-btn').onclick=e=>{e.stopPropagation();expandedAttarIndex=expanded?null:index;render()};
+   if(expanded){
+     const inl=card.querySelector('.attar-inline');
+     const val=(x='')=>String(x??'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+     inl.innerHTML=`<div class="inline-grid">
+      <div class="inline-field"><label>আতরের নাম</label><input data-f="name" value="${val(a.name)}"></div><div class="inline-field"><label>Type</label><input data-f="type" value="${val(a.type)}"></div><div class="inline-field"><label>Region</label><input data-f="region" value="${val(a.region)}"></div>
+      <div class="inline-field"><label>৩ মিলি (৳)</label><input type="number" data-p="3" value="${getPrice(a,3)??''}"></div><div class="inline-field"><label>৬ মিলি (৳)</label><input type="number" data-p="6" value="${getPrice(a,6)??''}"></div><div class="inline-field"><label>১২ মিলি (৳)</label><input type="number" data-p="12" value="${getPrice(a,12)??''}"></div>
+      <div class="inline-field inline-span-3"><label>Website URL</label><input data-f="url" value="${val(a.url)}"></div>
+      <div class="inline-field"><label>Gender</label><input data-f="gender" value="${val(a.gender)}"></div><div class="inline-field"><label>Longevity</label><input data-f="longevity" value="${val(a.longevity)}"></div><div class="inline-field"><label>Projection</label><textarea data-f="projection">${val(a.projection)}</textarea></div>
+      <div class="inline-field inline-span-3"><label>Bag Policy</label><textarea data-f="bagPolicy">${val(a.bagPolicy)}</textarea></div>
+      <div class="inline-field"><label>Top Note</label><textarea data-note="top">${val(a.notes.top)}</textarea></div><div class="inline-field"><label>Mid Note</label><textarea data-note="mid">${val(a.notes.mid)}</textarea></div><div class="inline-field"><label>Base Note</label><textarea data-note="base">${val(a.notes.base)}</textarea></div>
+     </div><div class="inline-actions"><button class="danger inline-delete">Delete</button><button class="secondary inline-cancel">Cancel</button><button class="inline-save">Save</button></div>`;
+     inl.querySelector('.inline-cancel').onclick=e=>{e.stopPropagation();expandedAttarIndex=null;render()};
+     inl.querySelector('.inline-delete').onclick=e=>{e.stopPropagation();deleteAttarAt(index,true)};
+     inl.querySelector('.inline-save').onclick=e=>{e.stopPropagation();saveInlineAttar(index,card)};
+   }
    card.addEventListener('dragstart',e=>{if(!draggableNow){e.preventDefault();return}attarDragState=index;suppressCopyUntil=Date.now()+700;card.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',String(index))});
    card.addEventListener('dragover',e=>{if(attarDragState===null||!draggableNow)return;e.preventDefault();e.dataTransfer.dropEffect='move';card.classList.add('drag-over')});
    card.addEventListener('dragleave',()=>card.classList.remove('drag-over'));
    card.addEventListener('drop',e=>{if(attarDragState===null||!draggableNow)return;e.preventDefault();card.classList.remove('drag-over');const from=attarDragState,to=index;if(from!==to){const [moved]=attars.splice(from,1);attars.splice(to,0,moved);saveAttars()}attarDragState=null;suppressCopyUntil=Date.now()+700;render()});
-   card.addEventListener('dragend',()=>{card.classList.remove('dragging','drag-over');attarDragState=null;suppressCopyUntil=Date.now()+500});
-   grid.appendChild(card);
+   card.addEventListener('dragend',()=>{card.classList.remove('dragging','drag-over');attarDragState=null;suppressCopyUntil=Date.now()+500});grid.appendChild(card);
  });
- if(!isFiltered){
-   const add=document.createElement('article');add.className='card add-card';
-   add.innerHTML='<div class="add-card-inner"><div class="add-card-plus">+</div><strong>Add New Attar</strong><div class="helper">নতুন আতর যোগ করুন</div></div>';
-   add.onclick=()=>openAttarModal(null);
-   grid.appendChild(add);
- }
- document.getElementById('count').textContent=`Attars 🧴 তালিকায় ${list.length}টি আতর দেখা যাচ্ছে`;
- document.getElementById('empty').style.display=list.length?'none':'block';
+ if(!isFiltered){const add=document.createElement('article');add.className='card add-card';add.innerHTML='<div class="add-card-inner"><div class="add-card-plus">+</div><strong>Add New Attar</strong><div class="helper">নতুন আতর যোগ করুন</div></div>';add.onclick=()=>openAttarModal(null);grid.appendChild(add)}
+ document.getElementById('count').textContent=`Attars 🧴 তালিকায় ${list.length}টি আতর দেখা যাচ্ছে`;document.getElementById('empty').style.display=list.length?'none':'block';renderRecent();
 }
+function saveInlineAttar(index,card){const get=f=>card.querySelector(`[data-f="${f}"]`)?.value.trim()||'';const name=get('name');if(!name)return alert('আতরের নাম লিখুন');const prices=[];[3,6,12].forEach(ml=>{const v=card.querySelector(`[data-p="${ml}"]`).value;if(v!=='')prices.push([ml,+v])});const oldName=attars[index].name;attars[index]={name,url:get('url'),type:get('type'),region:get('region'),gender:get('gender'),longevity:get('longevity'),projection:get('projection'),bagPolicy:get('bagPolicy'),prices,notes:{top:card.querySelector('[data-note="top"]').value.trim(),mid:card.querySelector('[data-note="mid"]').value.trim(),base:card.querySelector('[data-note="base"]').value.trim()}};if(oldName!==name){const i=limited3mlAttarNames.indexOf(oldName);if(i>=0)limited3mlAttarNames[i]=name}saveAttars();expandedAttarIndex=null;render()}
+
 function openCategoryModal(index=null){editingCategory=index;document.getElementById('categoryModalTitle').textContent=index===null?'New Category':'Edit Category';document.getElementById('categoryName').value=index===null?'':data[index].name;document.getElementById('categoryModal').classList.add('open')}
 function saveCategory(){const n=document.getElementById('categoryName').value.trim();if(!n)return alert('Category name লিখুন');if(editingCategory===null)data.push({name:n,items:[]});else data[editingCategory].name=n;save();closeModal('categoryModal');render()}
 function openTemplateModal(ci=null,ii=null){editingTemplate=(ci!==null&&ii!==null)?[ci,ii]:null;const s=document.getElementById('templateCategory');s.innerHTML='';data.forEach((c,i)=>{const o=document.createElement('option');o.value=i;o.textContent=categoryLabel(c.name);s.appendChild(o)});if(!data.length){alert('আগে একটি category তৈরি করুন');return}if(editingTemplate){const item=data[ci].items[ii];document.getElementById('templateModalTitle').textContent='Edit Template';s.value=ci;document.getElementById('templateTitle').value=item.title;document.getElementById('templateBody').value=item.body}else{document.getElementById('templateModalTitle').textContent='New Template';s.value=ci===null?active:ci;document.getElementById('templateTitle').value='';document.getElementById('templateBody').value=''}document.getElementById('templateModalDelete').style.display=editingTemplate?'inline-block':'none';document.getElementById('templateModal').classList.add('open')}
+
+function openDuplicatePicker(ci){
+  const items=data[ci]?.items||[];
+  if(!items.length)return alert('এই category-তে duplicate করার মতো কোনো template নেই।');
+  const list=items.map((it,i)=>`${i+1}. ${it.title}`).join('\n');
+  const answer=prompt(`যে template-টি duplicate করতে চান, তার নম্বর লিখুন:\n\n${list}`);
+  if(answer===null)return;
+  const index=Number(answer)-1;
+  if(!Number.isInteger(index)||index<0||index>=items.length)return alert('সঠিক template নম্বর লিখুন।');
+  duplicateTemplate(ci,index);
+}
+function duplicateTemplate(ci,ii){
+  const source=data[ci].items[ii];
+  const copy={title:`${source.title} (Copy)`,body:source.body};
+  data[ci].items.splice(ii+1,0,copy);
+  save();
+  render();
+  openTemplateModal(ci,ii+1);
+}
 function saveTemplate(){const ci=+document.getElementById('templateCategory').value,t=document.getElementById('templateTitle').value.trim(),b=document.getElementById('templateBody').value.trim();if(!t||!b)return alert('Title এবং body লিখুন');const updated={title:t,body:b};if(editingTemplate){const [oldCi,ii]=editingTemplate;if(oldCi===ci){data[oldCi].items[ii]=updated}else{data[oldCi].items.splice(ii,1);data[ci].items.push(updated)}}else{data[ci].items.push(updated)}active=ci;save();closeModal('templateModal');render()}
-function deleteCurrentTemplate(){if(!editingTemplate)return;const [ci,ii]=editingTemplate;if(!confirm('এই template delete করবেন?'))return;data[ci].items.splice(ii,1);active=ci;save();closeModal('templateModal');render()}
+function deleteCurrentTemplate(){if(!editingTemplate)return;const [ci,ii]=editingTemplate;if(!confirm('এই template delete করবেন?'))return;const snapshot=structuredClone(data),name=data[ci].items[ii].title;data[ci].items.splice(ii,1);active=ci;save();closeModal('templateModal');render();showUndo('Template deleted: '+name,()=>{data=snapshot;save();render()})}
 function generateExportHtml(){
   let html='<!doctype html>\n'+document.documentElement.outerHTML;
   const attarStart=html.indexOf('const defaultAttars=');
@@ -901,8 +588,8 @@ async function copyExportHtml(){
   await copyText(box.value);
 }
 function openManager(){const box=document.getElementById('managerList');box.innerHTML='';data.forEach((c,ci)=>{const sec=document.createElement('div');sec.style.borderBottom='1px solid #eee';sec.style.padding='12px 0';sec.innerHTML=`<div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><strong>${categoryLabel(c.name)}</strong><div><button class="secondary">Edit Category</button> <button class="danger">Delete</button></div></div>`;const bs=sec.querySelectorAll('button');bs[0].onclick=()=>{closeModal('managerModal');openCategoryModal(ci)};bs[1].onclick=()=>deleteCategory(ci);c.items.forEach((it,ii)=>{const row=document.createElement('div');row.style.cssText='display:flex;justify-content:space-between;gap:8px;padding:8px 0 0 14px';row.innerHTML=`<span>${it.title}</span><div><button class="secondary">Edit</button> <button class="danger">Delete</button></div>`;const rb=row.querySelectorAll('button');rb[0].onclick=()=>{closeModal('managerModal');openTemplateModal(ci,ii)};rb[1].onclick=()=>deleteTemplate(ci,ii);sec.appendChild(row)});box.appendChild(sec)});document.getElementById('managerModal').classList.add('open')}
-function deleteCategory(ci){if(!confirm('এই category এবং এর সব template delete করবেন?'))return;data.splice(ci,1);active=0;save();openManager();render()}
-function deleteTemplate(ci,ii){if(!confirm('এই template delete করবেন?'))return;data[ci].items.splice(ii,1);save();openManager();render()}
+function deleteCategory(ci){if(!confirm('এই category এবং এর সব template delete করবেন?'))return;const snapshot=structuredClone(data),name=data[ci].name;data.splice(ci,1);active=0;save();openManager();render();showUndo('Category deleted: '+name,()=>{data=snapshot;save();render();openManager()})}
+function deleteTemplate(ci,ii){if(!confirm('এই template delete করবেন?'))return;const snapshot=structuredClone(data),name=data[ci].items[ii].title;data[ci].items.splice(ii,1);save();openManager();render();showUndo('Template deleted: '+name,()=>{data=snapshot;save();render();openManager()})}
 function openAttarModal(index=null){
   editingAttar=index;
   const a=index===null?{name:'',url:'',type:'',region:'',gender:'ইউনিসেক্স',longevity:'',projection:'',bagPolicy:'',prices:[],notes:{top:'',mid:'',base:''}}:attars[index];
@@ -966,17 +653,58 @@ function saveAttar(){
 function deleteCurrentAttar(){if(editingAttar===null)return;deleteAttarAt(editingAttar,true)}
 function deleteAttarAt(index,fromEditModal){
   if(!confirm('এই আতরটি delete করবেন? এটি dynamic template থেকেও বাদ পড়বে।'))return;
-  const removed=attars[index];
-  attars.splice(index,1);
-  const idx=limited3mlAttarNames.indexOf(removed.name);
-  if(idx>=0)limited3mlAttarNames.splice(idx,1);
-  saveAttars();
-  if(fromEditModal){closeModal('attarModal')}
-  render();
+  const snapshot=structuredClone(attars),limitedSnapshot=[...limited3mlAttarNames],removed=attars[index];
+  attars.splice(index,1);const idx=limited3mlAttarNames.indexOf(removed.name);if(idx>=0)limited3mlAttarNames.splice(idx,1);saveAttars();expandedAttarIndex=null;
+  if(fromEditModal)closeModal('attarModal');render();showUndo('Attar deleted: '+removed.name,()=>{attars=snapshot;limited3mlAttarNames=limitedSnapshot;saveAttars();render()});
 }
 function closeModal(id){document.getElementById(id).classList.remove('open')}
 function resetData(){if(confirm('সব custom change মুছে default version ফিরিয়ে আনবেন?')){data=structuredClone(defaultData);attars=structuredClone(defaultAttars);limited3mlAttarNames=["Baccarat Rouge","Vampire Blood","Musk Fakhir","Jafran Musk","Paris Hilton"];active=0;save();saveAttars();render()}}
 document.getElementById('search').addEventListener('keydown',e=>{if(e.key==='Escape'){e.target.value='';clearSearchFilters();render()}});
+
+// Category bar hover auto-scroll: move the mouse near the left or right edge
+// to reveal categories that are outside the visible area.
+(function enableCategoryHoverAutoScroll(){
+  const nav=document.getElementById('nav');
+  if(!nav)return;
+  let hoverX=null;
+  let rafId=null;
+  const edgeZone=150;
+  const maxSpeed=14;
+
+  function frame(){
+    if(hoverX===null){rafId=null;return}
+    const rect=nav.getBoundingClientRect();
+    let speed=0;
+    const leftDistance=hoverX-rect.left;
+    const rightDistance=rect.right-hoverX;
+    if(leftDistance<edgeZone){
+      speed=-maxSpeed*(1-Math.max(0,leftDistance)/edgeZone);
+    }else if(rightDistance<edgeZone){
+      speed=maxSpeed*(1-Math.max(0,rightDistance)/edgeZone);
+    }
+    if(Math.abs(speed)>.15)nav.scrollLeft+=speed;
+    rafId=requestAnimationFrame(frame);
+  }
+
+  nav.addEventListener('mousemove',e=>{
+    hoverX=e.clientX;
+    if(!rafId)rafId=requestAnimationFrame(frame);
+  });
+  nav.addEventListener('mouseenter',e=>{
+    hoverX=e.clientX;
+    if(!rafId)rafId=requestAnimationFrame(frame);
+  });
+  nav.addEventListener('mouseleave',()=>{
+    hoverX=null;
+    if(rafId){cancelAnimationFrame(rafId);rafId=null}
+  });
+  nav.addEventListener('wheel',e=>{
+    if(Math.abs(e.deltaY)>Math.abs(e.deltaX)){
+      nav.scrollLeft+=e.deltaY;
+      e.preventDefault();
+    }
+  },{passive:false});
+})();
 render();
 </script>
 
